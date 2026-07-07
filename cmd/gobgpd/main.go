@@ -43,6 +43,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
 	"github.com/osrg/gobgp/v4/internal/pkg/version"
 	"github.com/osrg/gobgp/v4/pkg/config"
 	"github.com/osrg/gobgp/v4/pkg/metrics"
@@ -79,6 +80,10 @@ func main() {
 		SentryEnvironment string  `long:"sentry-environment" description:"Sentry environment" default:"development"`
 		SentrySampleRate  float64 `long:"sentry-sample-rate" description:"Sentry traces sample rate" default:"1.0"`
 		SentryDebug       bool    `long:"sentry-debug" description:"Sentry debug mode"`
+
+		// Bendrr fork (D-014): location-metric best-path tie-break.
+		LocationMetricFile   string `long:"location-metric-file" description:"YAML location-metric map for the D-014 best-path tie-break (one perspective row)"`
+		LocationRegistryFile string `long:"location-registry-file" description:"optional Community Name Registry YAML to validate the location-metric map against at startup"`
 	}
 	_, err := flags.Parse(&opts)
 	if err != nil {
@@ -173,6 +178,24 @@ func main() {
 		logger = slog.New(slog.NewTextHandler(output, lopts))
 	} else {
 		logger = slog.New(slog.NewJSONHandler(output, lopts))
+	}
+
+	// Bendrr fork (D-014): install the location-metric map before the server
+	// starts — the table is read-only once best-path selection is running.
+	// A map that fails validation is a startup failure, not a silent default.
+	if opts.LocationMetricFile != "" {
+		if err := table.LoadLocationMetricFile(opts.LocationMetricFile, opts.LocationRegistryFile); err != nil {
+			logger.Error("Failed to load location-metric map", slog.String("Error", err.Error()))
+			os.Exit(1)
+		}
+		logger.Info("Loaded location-metric map",
+			slog.String("File", opts.LocationMetricFile),
+			slog.Uint64("PerspectiveLocationID", uint64(table.LocationMetric.PerspectiveLocationID)),
+			slog.Int("Destinations", len(table.LocationMetric.Destinations)),
+			slog.Bool("RegistryValidated", opts.LocationRegistryFile != ""))
+	} else if opts.LocationRegistryFile != "" {
+		logger.Error("--location-registry-file requires --location-metric-file")
+		os.Exit(1)
 	}
 
 	if opts.Dry {
