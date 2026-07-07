@@ -1011,6 +1011,51 @@ func (s *BgpServer) getPossibleBest(peer *peer, family bgp.Family) []*table.Path
 	return peer.localRib.GetBestPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
 }
 
+// syncRankedAddPathSet computes the UPDATE/withdraw set that brings an
+// ADD-PATH peer's advertised set for newPath's destination in sync with the
+// top-SendMax paths in best-path ranked order (Bendrr D-034 / D-014: SendMax
+// slots follow the patched comparator chain, not arrival order).
+//
+// It returns announcements for ranked paths not yet advertised (and for
+// newPath itself when its attributes changed), and withdraws for previously
+// advertised paths that have been displaced below the SendMax cut. Displaced
+// and suppressed paths are flagged send-max-filtered so the existing
+// withdraw-time backfill and ListPath reporting stay consistent.
+//
+// The caller must hold the propagation bucket lock for newPath's prefix and
+// must pass the returned list to peer.updateRoutes before advertising.
+func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, family bgp.Family, newPath *table.Path) []*table.Path {
+	dest := rib.GetDestination(newPath)
+	if dest == nil {
+		return nil
+	}
+	sendMax := int(peer.getAddPathSendMax(family))
+	newLocalKey := newPath.GetLocalKey()
+
+	result := []*table.Path{}
+	slots := 0
+	for _, p := range dest.GetKnownPathList(peer.TableID(), peer.AS()) {
+		fp := s.filterpath(peer, p, nil)
+		if fp == nil {
+			continue
+		}
+		if slots < sendMax {
+			slots++
+			peer.unsetPathSendMaxFiltered(fp)
+			// re-announce the changed path itself; announce newly promoted paths
+			if fp.GetLocalKey() == newLocalKey || !peer.hasPathAlreadyBeenSent(fp) {
+				result = append(result, fp)
+			}
+		} else {
+			if peer.hasPathAlreadyBeenSent(fp) {
+				result = append(result, fp.Clone(true))
+			}
+			peer.setPathSendMaxFiltered(fp)
+		}
+	}
+	return result
+}
+
 func (s *BgpServer) getBestFromLocalCallback(peer *peer, rfList []bgp.Family, addEOR bool, routeRefresh bool, fn func([]*table.Path, []*table.Path)) {
 	if routeRefresh {
 		peer.routeRefreshInProgress.Lock()
@@ -1051,8 +1096,27 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 	}
 
 	for _, family := range peer.toGlobalFamilies(rfList) {
+		// Bendrr (D-034 / Spike 1 gate 2): cap the initial ADD-PATH dump at
+		// SendMax per destination. getPossibleBest returns paths in
+		// per-destination best-path ranked order (D-014 comparator chain),
+		// so the first SendMax paths of each destination are the ranked
+		// export set; the rest are flagged for withdraw-time backfill.
+		sendMax := 0
+		if peer.isAddPathSendEnabled(family) {
+			sendMax = int(peer.getAddPathSendMax(family))
+		}
+		slots := make(map[table.PathDestLocalKey]int)
 		for _, path := range s.getPossibleBest(peer, family) {
 			if p := s.filterpath(peer, path, nil); p != nil {
+				if sendMax > 0 {
+					k := p.GetDestLocalKey()
+					if slots[k] >= sendMax {
+						peer.setPathSendMaxFiltered(p)
+						continue
+					}
+					slots[k]++
+					peer.unsetPathSendMaxFiltered(p)
+				}
 				pathList = append(pathList, p)
 			} else {
 				filtered = append(filtered, filteredPathForPeer(peer, path))
@@ -1486,7 +1550,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						targetPeer.updateRoutes(l...)
 						return l
 					}()
-				} else {
+				} else if newPath.GetFamily() == bgp.RF_RTC_UC {
 					alreadySent := targetPeer.hasPathAlreadyBeenSent(newPath)
 					newPath := s.filterpath(targetPeer, newPath, nil)
 					// if the path is not filtered and the path has already been sent or land in the limit, we can send it
@@ -1497,14 +1561,12 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						if !alreadySent {
 							targetPeer.updateRoutes(newPath)
 						}
-						if newPath.GetFamily() == bgp.RF_RTC_UC {
-							// we assumes that new "path" nlri was already sent before. This assumption avoids the
-							// infinite UPDATE loop between Route Reflector and its clients.
-							for _, old := range dsts[0].OldKnownPathList {
-								if old.IsLocal() {
-									bestList = []*table.Path{}
-									break
-								}
+						// we assumes that new "path" nlri was already sent before. This assumption avoids the
+						// infinite UPDATE loop between Route Reflector and its clients.
+						for _, old := range dsts[0].OldKnownPathList {
+							if old.IsLocal() {
+								bestList = []*table.Path{}
+								break
 							}
 						}
 					} else {
@@ -1512,6 +1574,14 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						targetPeer.setPathSendMaxFiltered(newPath)
 						targetPeer.fsm.logger.Warn("exceeding max routes for prefix", slog.String("Prefix", newPath.GetPrefix()))
 					}
+				} else {
+					// Bendrr (D-034 / Spike 1 gate 2): SendMax slots follow
+					// best-path rank (D-014 comparator chain included), not
+					// arrival order. Sync this peer's advertised set for the
+					// destination to the top-SendMax ranked paths, withdrawing
+					// any previously sent path that has been displaced.
+					bestList = s.syncRankedAddPathSet(rib, targetPeer, f, newPath)
+					targetPeer.updateRoutes(bestList...)
 				}
 				if needToAdvertise(targetPeer) && len(bestList) > 0 {
 					// targetPeer.updateRoutes was already called while constructing bestList above.
