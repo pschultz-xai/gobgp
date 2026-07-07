@@ -501,6 +501,12 @@ func (dest *destination) insertSort(newPath *Path) {
 			return false
 		}
 
+		if b := compareByLocationMetric(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
+		}
+
 		if b := compareByAge(path1, path2); b == path1 {
 			return true
 		} else if b == path2 {
