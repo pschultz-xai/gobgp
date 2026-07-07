@@ -3975,6 +3975,35 @@ func (r *RoutingPolicy) ApplyPolicy(id string, dir PolicyDirection, before *Path
 	}
 }
 
+// ApplyPolicyByName applies a single named policy to the path, bypassing the
+// live assignment map. The default action when no statement matches is accept;
+// an empty name accepts unconditionally.
+//
+// Bendrr fork (D-031 / Spike 1 gate 4): the shadow-mode would-export evaluator
+// uses this to simulate the staged active export policy while the assigned
+// export policy is reject-all.
+func (r *RoutingPolicy) ApplyPolicyByName(name string, before *Path, options *PolicyOptions) (*Path, error) {
+	if before == nil {
+		return nil, nil
+	}
+	if before.IsWithdraw || name == "" {
+		return before, nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	p, ok := r.policyMap[name]
+	if !ok {
+		return nil, fmt.Errorf("not found policy %s", name)
+	}
+	result, after := p.Apply(r.logger, before, options)
+	if result == ROUTE_TYPE_REJECT {
+		return nil, nil
+	}
+	return after, nil
+}
+
 func (r *RoutingPolicy) getPolicy(id string, dir PolicyDirection) []*Policy {
 	a, ok := r.assignmentMap[id]
 	if !ok {
