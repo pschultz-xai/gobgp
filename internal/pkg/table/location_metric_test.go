@@ -198,6 +198,42 @@ func TestMixedRIBSemantics_fullChainOrdering(t *testing.T) {
 	assert.Equal(t, ibgpLocal, d2.knownPathList[2])
 }
 
+// Spike 1 contract §3.4 (LLGR): the LLGR_STALE well-known community is the
+// FIRST slot in the best-path chain — above LOCAL_PREF, local-origin, and
+// the D-014 location metric. A stale-but-nearest path (even an injected
+// local-origin one) must rank below any fresh path, so LLGR depreference
+// dominates Bendrr's ranked SendMax curation.
+func TestSessionBehavior_llgrStaleRanksBelowEverything(t *testing.T) {
+	defer resetLocationMetric()
+
+	LocationMetric.GlobalAdmin = testGlobalAdmin
+	LocationMetric.PerspectiveLocationID = 104
+	LocationMetric.Destinations = map[uint32]uint32{
+		102: 30, // lax — closer
+		185: 90, // fra — farther
+	}
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	// Injected (local-origin) path, best location metric — but LLGR-stale.
+	staleNear := pathWithLocationLC(nil, nlri, 1, 102)
+	staleNear.SetCommunities([]uint32{uint32(bgp.COMMUNITY_LLGR_STALE)}, false)
+	require.True(t, staleNear.IsLLGRStale())
+
+	// Fresh iBGP-learned path, worst location metric — still must win.
+	freshFar := pathWithLocationLC(newIBGPPeer("10.0.0.1"), nlri, 0, 185)
+
+	d := newDestination(nlri, 0)
+	d.Calculate(logger, staleNear)
+	d.Calculate(logger, freshFar)
+
+	require.Len(t, d.knownPathList, 2)
+	assert.Equal(t, freshFar, d.knownPathList[0],
+		"a fresh path must outrank an LLGR-stale path regardless of origin and metric")
+	assert.Equal(t, staleNear, d.knownPathList[1])
+}
+
 func resetLocationMetric() {
 	LocationMetric.Reset()
 }
