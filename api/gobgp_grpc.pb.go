@@ -95,6 +95,7 @@ const (
 	GoBgpService_DeleteBmp_FullMethodName              = "/api.GoBgpService/DeleteBmp"
 	GoBgpService_ListBmp_FullMethodName                = "/api.GoBgpService/ListBmp"
 	GoBgpService_SetLogLevel_FullMethodName            = "/api.GoBgpService/SetLogLevel"
+	GoBgpService_ReloadLocationMetric_FullMethodName   = "/api.GoBgpService/ReloadLocationMetric"
 )
 
 // GoBgpServiceClient is the client API for GoBgpService service.
@@ -158,6 +159,9 @@ type GoBgpServiceClient interface {
 	DeleteBmp(ctx context.Context, in *DeleteBmpRequest, opts ...grpc.CallOption) (*DeleteBmpResponse, error)
 	ListBmp(ctx context.Context, in *ListBmpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListBmpResponse], error)
 	SetLogLevel(ctx context.Context, in *SetLogLevelRequest, opts ...grpc.CallOption) (*SetLogLevelResponse, error)
+	// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
+	// location-metric map.
+	ReloadLocationMetric(ctx context.Context, in *ReloadLocationMetricRequest, opts ...grpc.CallOption) (*ReloadLocationMetricResponse, error)
 }
 
 type goBgpServiceClient struct {
@@ -838,6 +842,16 @@ func (c *goBgpServiceClient) SetLogLevel(ctx context.Context, in *SetLogLevelReq
 	return out, nil
 }
 
+func (c *goBgpServiceClient) ReloadLocationMetric(ctx context.Context, in *ReloadLocationMetricRequest, opts ...grpc.CallOption) (*ReloadLocationMetricResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReloadLocationMetricResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_ReloadLocationMetric_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GoBgpServiceServer is the server API for GoBgpService service.
 // All implementations must embed UnimplementedGoBgpServiceServer
 // for forward compatibility.
@@ -899,6 +913,9 @@ type GoBgpServiceServer interface {
 	DeleteBmp(context.Context, *DeleteBmpRequest) (*DeleteBmpResponse, error)
 	ListBmp(*ListBmpRequest, grpc.ServerStreamingServer[ListBmpResponse]) error
 	SetLogLevel(context.Context, *SetLogLevelRequest) (*SetLogLevelResponse, error)
+	// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
+	// location-metric map.
+	ReloadLocationMetric(context.Context, *ReloadLocationMetricRequest) (*ReloadLocationMetricResponse, error)
 	mustEmbedUnimplementedGoBgpServiceServer()
 }
 
@@ -1073,6 +1090,9 @@ func (UnimplementedGoBgpServiceServer) ListBmp(*ListBmpRequest, grpc.ServerStrea
 }
 func (UnimplementedGoBgpServiceServer) SetLogLevel(context.Context, *SetLogLevelRequest) (*SetLogLevelResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetLogLevel not implemented")
+}
+func (UnimplementedGoBgpServiceServer) ReloadLocationMetric(context.Context, *ReloadLocationMetricRequest) (*ReloadLocationMetricResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReloadLocationMetric not implemented")
 }
 func (UnimplementedGoBgpServiceServer) mustEmbedUnimplementedGoBgpServiceServer() {}
 func (UnimplementedGoBgpServiceServer) testEmbeddedByValue()                      {}
@@ -1983,6 +2003,24 @@ func _GoBgpService_SetLogLevel_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GoBgpService_ReloadLocationMetric_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReloadLocationMetricRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).ReloadLocationMetric(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_ReloadLocationMetric_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).ReloadLocationMetric(ctx, req.(*ReloadLocationMetricRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GoBgpService_ServiceDesc is the grpc.ServiceDesc for GoBgpService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2153,6 +2191,10 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetLogLevel",
 			Handler:    _GoBgpService_SetLogLevel_Handler,
+		},
+		{
+			MethodName: "ReloadLocationMetric",
+			Handler:    _GoBgpService_ReloadLocationMetric_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

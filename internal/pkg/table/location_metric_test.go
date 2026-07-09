@@ -30,12 +30,10 @@ const testGlobalAdmin uint32 = 64500
 func TestLocationMetricTable_prefersLowerMetric(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104 // ord
-	LocationMetric.Destinations = map[uint32]uint32{
+	tbl := installTestLocationMetric(104 /* ord */, map[uint32]uint32{
 		102: 50,  // lax
 		185: 120, // fra
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -44,18 +42,16 @@ func TestLocationMetricTable_prefersLowerMetric(t *testing.T) {
 	fra := pathWithLocationLC(nil, nlri, 2, 185)
 
 	assert.Equal(t, lax, compareByLocationMetric(lax, fra))
-	assert.Equal(t, uint64(0), LocationMetric.MissingLookupCount())
+	assert.Equal(t, uint64(0), tbl.MissingLookupCount())
 }
 
 func TestLocationMetricTable_sameMetricReturnsNil(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104
-	LocationMetric.Destinations = map[uint32]uint32{
+	installTestLocationMetric(104, map[uint32]uint32{
 		102: 50,
 		185: 50,
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -69,11 +65,9 @@ func TestLocationMetricTable_sameMetricReturnsNil(t *testing.T) {
 func TestLocationMetricTable_ownLocationDefaultsToZero(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104
-	LocationMetric.Destinations = map[uint32]uint32{
+	installTestLocationMetric(104, map[uint32]uint32{
 		102: 50,
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -87,11 +81,9 @@ func TestLocationMetricTable_ownLocationDefaultsToZero(t *testing.T) {
 func TestLocationMetricTable_missingLocationUsesSentinelAndAlerts(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104
-	LocationMetric.Destinations = map[uint32]uint32{
+	tbl := installTestLocationMetric(104, map[uint32]uint32{
 		102: 50,
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -100,11 +92,11 @@ func TestLocationMetricTable_missingLocationUsesSentinelAndAlerts(t *testing.T) 
 	missingLC := pathWithoutLocationLC(nil, nlri)
 	unknownLoc := pathWithLocationLC(nil, nlri, 2, 999)
 
-	assert.Equal(t, uint32(LocationMetricMissingSentinel), LocationMetric.MetricForPath(missingLC))
-	assert.Equal(t, uint32(LocationMetricMissingSentinel), LocationMetric.MetricForPath(unknownLoc))
+	assert.Equal(t, uint32(LocationMetricMissingSentinel), tbl.MetricForPath(missingLC))
+	assert.Equal(t, uint32(LocationMetricMissingSentinel), tbl.MetricForPath(unknownLoc))
 	assert.Equal(t, known, compareByLocationMetric(known, missingLC))
 	assert.Equal(t, known, compareByLocationMetric(known, unknownLoc))
-	assert.Equal(t, uint64(4), LocationMetric.MissingLookupCount())
+	assert.Equal(t, uint64(4), tbl.MissingLookupCount())
 }
 
 // Spike 1 gate 1a (D-042): injected (API/local) paths rank above iBGP-learned paths.
@@ -128,12 +120,10 @@ func TestMixedRIBSemantics_injectedRemoteBeatsIBGPLocal(t *testing.T) {
 func TestMixedRIBSemantics_remoteVsRemoteUsesLocationMetric(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104
-	LocationMetric.Destinations = map[uint32]uint32{
+	installTestLocationMetric(104, map[uint32]uint32{
 		102: 30,
 		185: 90,
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -158,12 +148,10 @@ func TestMixedRIBSemantics_remoteVsRemoteUsesLocationMetric(t *testing.T) {
 func TestMixedRIBSemantics_fullChainOrdering(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104 // ord perspective
-	LocationMetric.Destinations = map[uint32]uint32{
+	installTestLocationMetric(104 /* ord perspective */, map[uint32]uint32{
 		102: 30, // lax — closer
 		185: 90, // fra — farther
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -206,12 +194,10 @@ func TestMixedRIBSemantics_fullChainOrdering(t *testing.T) {
 func TestSessionBehavior_llgrStaleRanksBelowEverything(t *testing.T) {
 	defer resetLocationMetric()
 
-	LocationMetric.GlobalAdmin = testGlobalAdmin
-	LocationMetric.PerspectiveLocationID = 104
-	LocationMetric.Destinations = map[uint32]uint32{
+	installTestLocationMetric(104, map[uint32]uint32{
 		102: 30, // lax — closer
 		185: 90, // fra — farther
-	}
+	})
 
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
@@ -235,7 +221,19 @@ func TestSessionBehavior_llgrStaleRanksBelowEverything(t *testing.T) {
 }
 
 func resetLocationMetric() {
-	LocationMetric.Reset()
+	ResetLocationMetric()
+}
+
+// installTestLocationMetric installs a fresh table and returns it for
+// counter/lookup assertions.
+func installTestLocationMetric(perspective uint32, dests map[uint32]uint32) *LocationMetricTable {
+	tbl := &LocationMetricTable{
+		GlobalAdmin:           testGlobalAdmin,
+		PerspectiveLocationID: perspective,
+		Destinations:          dests,
+	}
+	InstallLocationMetric(tbl)
+	return tbl
 }
 
 func newIBGPPeer(addr string) *PeerInfo {

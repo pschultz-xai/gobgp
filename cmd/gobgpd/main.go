@@ -188,10 +188,11 @@ func main() {
 			logger.Error("Failed to load location-metric map", slog.String("Error", err.Error()))
 			os.Exit(1)
 		}
+		lm := table.CurrentLocationMetric()
 		logger.Info("Loaded location-metric map",
 			slog.String("File", opts.LocationMetricFile),
-			slog.Uint64("PerspectiveLocationID", uint64(table.LocationMetric.PerspectiveLocationID)),
-			slog.Int("Destinations", len(table.LocationMetric.Destinations)),
+			slog.Uint64("PerspectiveLocationID", uint64(lm.PerspectiveLocationID)),
+			slog.Int("Destinations", len(lm.Destinations)),
 			slog.Bool("RegistryValidated", opts.LocationRegistryFile != ""))
 	} else if opts.LocationRegistryFile != "" {
 		logger.Error("--location-registry-file requires --location-metric-file")
@@ -270,9 +271,32 @@ func main() {
 		}
 	}
 
+	// Bendrr fork (D-066): SIGHUP is the fabric-independent break-glass
+	// trigger for the location-metric map reload, wired to the same code
+	// path as the ReloadLocationMetric RPC. Failures keep the running map.
+	reloadLocationMetric := func() {
+		if opts.LocationMetricFile == "" {
+			return
+		}
+		if _, err := bgpServer.ReloadLocationMetric("", "", false); err != nil {
+			logger.Warn("Location-metric reload failed; keeping running map",
+				slog.String("File", opts.LocationMetricFile),
+				slog.String("Error", err.Error()))
+		}
+	}
+
 	if opts.ConfigFile == "" {
-		<-sigCh
-		stopServer(bgpServer, opts.UseSdNotify)
+		if opts.LocationMetricFile != "" {
+			signal.Notify(sigCh, syscall.SIGHUP)
+		}
+		for sig := range sigCh {
+			if sig == syscall.SIGHUP {
+				reloadLocationMetric()
+				continue
+			}
+			stopServer(bgpServer, opts.UseSdNotify)
+			return
+		}
 		return
 	}
 
@@ -325,6 +349,10 @@ func main() {
 			logger.Warn("Failed to update config", slog.String("File", opts.ConfigFile), slog.String("Error", err.Error()))
 			continue
 		}
+
+		// Bendrr fork (D-066): SIGHUP also re-reads the mounted
+		// location-metric map (no-op when the map is unchanged).
+		reloadLocationMetric()
 	}
 }
 
