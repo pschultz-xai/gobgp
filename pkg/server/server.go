@@ -1029,12 +1029,22 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 	if dest == nil {
 		return nil
 	}
-	sendMax := int(peer.getAddPathSendMax(family))
 	newLocalKey := newPath.GetLocalKey()
+	return s.syncRankedAddPathSetFromList(peer, family, dest.GetKnownPathList(peer.TableID(), peer.AS()), &newLocalKey)
+}
+
+// syncRankedAddPathSetFromList is the core of syncRankedAddPathSet operating
+// on an already-ranked known-path list. reannounceKey, when non-nil, forces
+// re-announcing the path with that local key even when it has already been
+// sent (used when that path's attributes just changed); the D-066 metric-map
+// re-rank passes nil because no path content changed — only rank order — so
+// already-advertised paths that stay inside the SendMax cut cost nothing.
+func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey) []*table.Path {
+	sendMax := int(peer.getAddPathSendMax(family))
 
 	result := []*table.Path{}
 	slots := 0
-	for _, p := range dest.GetKnownPathList(peer.TableID(), peer.AS()) {
+	for _, p := range known {
 		fp := s.filterpath(peer, p, nil)
 		if fp == nil {
 			continue
@@ -1043,7 +1053,7 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 			slots++
 			peer.unsetPathSendMaxFiltered(fp)
 			// re-announce the changed path itself; announce newly promoted paths
-			if fp.GetLocalKey() == newLocalKey || !peer.hasPathAlreadyBeenSent(fp) {
+			if reannounceKey != nil && fp.GetLocalKey() == *reannounceKey || !peer.hasPathAlreadyBeenSent(fp) {
 				result = append(result, fp)
 			}
 		} else {
