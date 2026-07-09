@@ -18,6 +18,7 @@ package server
 import (
 	"fmt"
 	"log/slog"
+	"math/bits"
 	"net"
 	"net/netip"
 	"slices"
@@ -96,10 +97,29 @@ func newDynamicPeer(g *oc.Global, neighborAddress string, pg *oc.PeerGroup, loc 
 	return newPeer(g, &conf, bgp.BGP_FSM_ACTIVE, loc, policy, logger)
 }
 
-// pathIDSet is the set of add-path local identifiers advertised for a destination.
-// Values of this type are stored in peer.sentPaths and MUST only be accessed
-// under the propagation bucket lock for the corresponding prefix.
-type pathIDSet map[uint32]struct{}
+// advInlineIDs is the number of add-path local identifiers tracked inline in
+// advertisedState bitmaps. localIDs are allocated dense-from-zero per
+// destination (destination.localIdMap), so IDs at or above this bound require
+// more than advInlineIDs-1 concurrent paths at one destination and are
+// tracked in the peer's overflow map instead.
+const advInlineIDs = 64
+
+// advertisedState is the per-destination export bookkeeping for one peer
+// (Bendrr D-062). Bit i of each field corresponds to the path with add-path
+// localID i; bit 0 doubles as the non-add-path advertisement flag, because
+// advertisedPathID returns 0 for peers without add-path send and real
+// localIDs start at 1.
+type advertisedState struct {
+	sent     uint64 // localIDs advertised to the peer (formerly sentPaths)
+	filtered uint64 // localIDs suppressed by SendMax (formerly sendMaxPathFiltered)
+}
+
+// advOverflowState mirrors advertisedState for a single path with
+// localID >= advInlineIDs.
+type advOverflowState struct {
+	sent     bool
+	filtered bool
+}
 
 type peer struct {
 	tableId           string
@@ -109,15 +129,21 @@ type peer struct {
 	localRib          *table.TableManager
 	peerInfo          atomic.Pointer[table.PeerInfo]
 	prefixLimitWarned map[bgp.Family]bool // protected by fsm.lock
-	// map[table.PathDestLocalKey]pathIDSet, with inner pathIDSets protected
-	// by the matching server propagation bucket for the route prefix.
-	// All methods that read or mutate a pathIDSet value (updateRoutes,
-	// getRoutesCount, hasPathAlreadyBeenSent) MUST be called under the
-	// bucket lock for that prefix (sharedData.propagateBucket).
-	sentPaths sync.Map
-	// map[table.PathLocalKey]struct{}
-	sendMaxPathFiltered sync.Map
-	llgrEndChs          []chan struct{} // protected by fsm.lock
+	// Compact per-destination export bookkeeping (Bendrr D-062), replacing
+	// two sync.Maps with one entry per (destination, pathID). advMu is a
+	// leaf lock taken only inside the accessor methods below; it provides
+	// the same per-operation safety the sync.Maps gave to off-loop readers
+	// (ListPath, soft-reconfig). Cross-operation consistency for a
+	// destination (e.g. syncRankedAddPathSet's read-modify-write sequences)
+	// still comes from the server propagation bucket lock for the prefix
+	// (sharedData.propagateBucket), exactly as before.
+	advMu     sync.Mutex
+	advRoutes map[table.PathDestLocalKey]advertisedState
+	// advOverflow holds state for paths with localID >= advInlineIDs;
+	// lazily allocated and nil in practice. Neither map retains zero-valued
+	// entries.
+	advOverflow map[table.PathLocalKey]advOverflowState
+	llgrEndChs  []chan struct{} // protected by fsm.lock
 	longLivedRunning    atomic.Bool
 	// Route Target Membership handler after import policy (for constrained VPN distribution).
 	rtmHandler *table.RouteTargetMembershipHandler
@@ -131,6 +157,7 @@ func newPeer(g *oc.Global, conf *oc.Neighbor, state bgp.FSMState, loc *table.Tab
 		policy:            policy,
 		fsm:               newFSM(g, conf, state, logger.With(slog.String("Topic", "Peer"), slog.String("Key", conf.State.NeighborAddress.String()))),
 		prefixLimitWarned: make(map[bgp.Family]bool),
+		advRoutes:         make(map[table.PathDestLocalKey]advertisedState),
 	}
 	if peer.isRouteServerClient() {
 		peer.tableId = conf.State.NeighborAddress.String()
@@ -237,15 +264,19 @@ func (peer *peer) getAddPathSendMax(family bgp.Family) uint8 {
 
 func (peer *peer) getRoutesCount(family bgp.Family, dstPrefix string) uint8 {
 	destLocalKey := table.NewPathDestLocalKey(family, dstPrefix)
-	if identifiers, ok := peer.sentPaths.Load(*destLocalKey); ok {
-		count := len(identifiers.(pathIDSet))
-		// the send-max config is uint8, so we need to check for overflow
-		if count > int(^uint8(0)) {
-			return ^uint8(0)
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	count := bits.OnesCount64(peer.advRoutes[*destLocalKey].sent)
+	for key, st := range peer.advOverflow {
+		if st.sent && key.PathDestLocalKey == *destLocalKey {
+			count++
 		}
-		return uint8(count)
 	}
-	return 0
+	// the send-max config is uint8, so we need to check for overflow
+	if count > int(^uint8(0)) {
+		return ^uint8(0)
+	}
+	return uint8(count)
 }
 
 func (peer *peer) advertisedPathID(path *table.Path) uint32 {
@@ -259,33 +290,14 @@ func (peer *peer) updateRoutes(paths ...*table.Path) {
 	if len(paths) == 0 {
 		return
 	}
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
 	for _, path := range paths {
 		if path == nil || path.IsEOR() {
 			continue
 		}
-		destLocalKey := path.GetDestLocalKey()
-		pathID := peer.advertisedPathID(path)
-
-		identifiersValue, destExists := peer.sentPaths.Load(destLocalKey)
-		if path.IsWithdraw && destExists {
-			identifiers := identifiersValue.(pathIDSet)
-			delete(identifiers, pathID)
-			if len(identifiers) == 0 {
-				peer.sentPaths.Delete(destLocalKey)
-			}
-		} else if !path.IsWithdraw {
-			var identifiers pathIDSet
-			if destExists {
-				identifiers = identifiersValue.(pathIDSet)
-			} else {
-				identifiers = make(pathIDSet)
-			}
-			identifiers[pathID] = struct{}{}
-			if !destExists {
-				// store only the first insert, mutations are inplace
-				peer.sentPaths.Store(destLocalKey, identifiers)
-			}
-		}
+		key := table.PathLocalKey{PathDestLocalKey: path.GetDestLocalKey(), Id: peer.advertisedPathID(path)}
+		peer.setSentLocked(key, !path.IsWithdraw)
 	}
 }
 
@@ -293,44 +305,137 @@ func (peer *peer) isPathSendMaxFiltered(path *table.Path) bool {
 	if path == nil {
 		return false
 	}
-	_, found := peer.sendMaxPathFiltered.Load(path.GetLocalKey())
-	return found
+	key := path.GetLocalKey()
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	if key.Id >= advInlineIDs {
+		return peer.advOverflow[key].filtered
+	}
+	return peer.advRoutes[key.PathDestLocalKey].filtered&(1<<key.Id) != 0
 }
 
 func (peer *peer) setPathSendMaxFiltered(path *table.Path) {
 	if path == nil {
 		return
 	}
-	peer.sendMaxPathFiltered.Store(path.GetLocalKey(), struct{}{})
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	peer.setFilteredLocked(path.GetLocalKey(), true)
 }
 
 func (peer *peer) unsetPathSendMaxFiltered(path *table.Path) bool {
 	if path == nil {
 		return false
 	}
-	if _, ok := peer.sendMaxPathFiltered.Load(path.GetLocalKey()); !ok {
-		return false
-	}
-	peer.sendMaxPathFiltered.Delete(path.GetLocalKey())
-	return true
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	return peer.setFilteredLocked(path.GetLocalKey(), false)
 }
 
 func (peer *peer) hasPathAlreadyBeenSent(path *table.Path) bool {
 	if path == nil {
 		return false
 	}
-	destLocalKey := path.GetDestLocalKey()
-	identifiers, dstExist := peer.sentPaths.Load(destLocalKey)
-	if !dstExist {
-		return false
+	key := table.PathLocalKey{PathDestLocalKey: path.GetDestLocalKey(), Id: peer.advertisedPathID(path)}
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	if key.Id >= advInlineIDs {
+		return peer.advOverflow[key].sent
 	}
-	_, pathExist := identifiers.(pathIDSet)[peer.advertisedPathID(path)]
-	return pathExist
+	return peer.advRoutes[key.PathDestLocalKey].sent&(1<<key.Id) != 0
 }
 
 func (peer *peer) resetAdvertisedRoutes() {
-	peer.sentPaths.Clear()
-	peer.sendMaxPathFiltered.Clear()
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	peer.advRoutes = make(map[table.PathDestLocalKey]advertisedState)
+	peer.advOverflow = nil
+}
+
+// setSentLocked sets or clears the advertised bit for key. Caller must hold
+// advMu.
+func (peer *peer) setSentLocked(key table.PathLocalKey, on bool) {
+	if key.Id >= advInlineIDs {
+		st := peer.advOverflow[key]
+		st.sent = on
+		peer.storeOverflowLocked(key, st)
+		return
+	}
+	st := peer.advRoutes[key.PathDestLocalKey]
+	if on {
+		st.sent |= 1 << key.Id
+	} else {
+		st.sent &^= 1 << key.Id
+	}
+	peer.storeAdvLocked(key.PathDestLocalKey, st)
+}
+
+// setFilteredLocked sets or clears the send-max-filtered bit for key and
+// reports whether the bit was set before the call. Caller must hold advMu.
+func (peer *peer) setFilteredLocked(key table.PathLocalKey, on bool) bool {
+	if key.Id >= advInlineIDs {
+		st := peer.advOverflow[key]
+		was := st.filtered
+		st.filtered = on
+		peer.storeOverflowLocked(key, st)
+		return was
+	}
+	st := peer.advRoutes[key.PathDestLocalKey]
+	was := st.filtered&(1<<key.Id) != 0
+	if on {
+		st.filtered |= 1 << key.Id
+	} else {
+		st.filtered &^= 1 << key.Id
+	}
+	peer.storeAdvLocked(key.PathDestLocalKey, st)
+	return was
+}
+
+// storeAdvLocked stores st for destKey, dropping fully-zero entries so the
+// map never retains empty state. Caller must hold advMu.
+func (peer *peer) storeAdvLocked(destKey table.PathDestLocalKey, st advertisedState) {
+	if st == (advertisedState{}) {
+		delete(peer.advRoutes, destKey)
+		return
+	}
+	peer.advRoutes[destKey] = st
+}
+
+// storeOverflowLocked stores st for key in the lazily-allocated overflow map,
+// dropping fully-zero entries. Caller must hold advMu.
+func (peer *peer) storeOverflowLocked(key table.PathLocalKey, st advOverflowState) {
+	if st == (advOverflowState{}) {
+		delete(peer.advOverflow, key)
+		return
+	}
+	if peer.advOverflow == nil {
+		peer.advOverflow = make(map[table.PathLocalKey]advOverflowState)
+	}
+	peer.advOverflow[key] = st
+}
+
+// advertisedDestinationCount returns the number of destinations with at least
+// one advertised path (the entry count of the former sentPaths map).
+func (peer *peer) advertisedDestinationCount() int {
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	count := 0
+	for _, st := range peer.advRoutes {
+		if st.sent != 0 {
+			count++
+		}
+	}
+	overflowDests := make(map[table.PathDestLocalKey]struct{})
+	for key, st := range peer.advOverflow {
+		if !st.sent {
+			continue
+		}
+		if peer.advRoutes[key.PathDestLocalKey].sent != 0 {
+			continue // destination already counted above
+		}
+		overflowDests[key.PathDestLocalKey] = struct{}{}
+	}
+	return count + len(overflowDests)
 }
 
 func (peer *peer) isDynamicNeighbor() bool {
