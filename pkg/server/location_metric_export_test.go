@@ -46,10 +46,12 @@ const (
 // restores it when the test finishes.
 func mountLocationMetricTable(t *testing.T, destinations map[uint32]uint32) {
 	t.Helper()
-	table.LocationMetric.GlobalAdmin = lmTestGlobalAdmin
-	table.LocationMetric.PerspectiveLocationID = lmTestPerspective
-	table.LocationMetric.Destinations = destinations
-	t.Cleanup(table.LocationMetric.Reset)
+	table.InstallLocationMetric(&table.LocationMetricTable{
+		GlobalAdmin:           lmTestGlobalAdmin,
+		PerspectiveLocationID: lmTestPerspective,
+		Destinations:          destinations,
+	})
+	t.Cleanup(table.ResetLocationMetric)
 }
 
 // startLocationMetricPair starts the pod-side server (s1, exporter with

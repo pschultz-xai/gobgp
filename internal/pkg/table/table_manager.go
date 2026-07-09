@@ -468,6 +468,50 @@ func (manager *TableManager) GetPathListWithSource(id string, rfList []bgp.Famil
 	return paths
 }
 
+// ReRankDestinations re-sorts every destination in every table under the
+// current best-path comparator chain. Needed when a global comparator input
+// changes out from under already-sorted knownPathLists — the D-066
+// location-metric map reload — because insertSort relies on the sorted
+// invariant for every future incremental update.
+//
+// It processes one shard at a time: the shard write lock is held for the
+// re-sort only, then fn is invoked with the shard's diffs after the lock is
+// released so the caller can propagate export changes without holding table
+// locks. Returns the number of destinations examined and the number whose
+// ranked order changed.
+//
+// The caller must guarantee no concurrent table mutation for the whole walk
+// (the BgpServer runs this inside a mgmt operation, which holds the server
+// lock exclusively).
+func (manager *TableManager) ReRankDestinations(fn func([]*Update)) (int, int) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+
+	total, changed := 0, 0
+	for _, t := range manager.tables {
+		for _, shard := range t.destinations.shards {
+			var updates []*Update
+			shard.mu.Lock()
+			for _, dests := range shard.mp {
+				for _, dest := range dests {
+					total++
+					if u, ok := dest.reSort(); ok {
+						updates = append(updates, u)
+					}
+				}
+			}
+			shard.mu.Unlock()
+			if len(updates) > 0 {
+				changed += len(updates)
+				if fn != nil {
+					fn(updates)
+				}
+			}
+		}
+	}
+	return total, changed
+}
+
 func (manager *TableManager) GetDestination(path *Path) *destination {
 	if path == nil {
 		return nil
