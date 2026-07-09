@@ -16,6 +16,7 @@
 package table
 
 import (
+	"maps"
 	"sync/atomic"
 )
 
@@ -29,11 +30,13 @@ const (
 	LocationMetricMissingSentinel uint32 = ^uint32(0) - 1
 )
 
-// LocationMetric holds the per-instance location-distance row used by the
-// patched best-path comparator (D-014). Each GoBGP instance mounts one
-// perspective (source location) and looks up destination metrics from the
-// path's stamped :40: large community.
-var LocationMetric LocationMetricTable
+// locationMetric holds the currently installed per-instance location-distance
+// row used by the patched best-path comparator (D-014). It is an atomic
+// pointer so an explicit config reload (D-066) can swap the whole table while
+// best-path selection is running; each comparison loads the pointer once, so
+// a comparison is internally consistent even mid-swap. Installed tables are
+// immutable: reload builds a fresh LocationMetricTable and swaps it in.
+var locationMetric atomic.Pointer[LocationMetricTable]
 
 type LocationMetricTable struct {
 	GlobalAdmin           uint32
@@ -43,19 +46,43 @@ type LocationMetricTable struct {
 	missingLookups atomic.Uint64
 }
 
-func (t *LocationMetricTable) Enabled() bool {
-	return t.GlobalAdmin != 0 && t.PerspectiveLocationID != 0 && len(t.Destinations) > 0
+// CurrentLocationMetric returns the installed table, or nil when no map is
+// mounted. The returned table must be treated as read-only.
+func CurrentLocationMetric() *LocationMetricTable {
+	return locationMetric.Load()
 }
 
-func (t *LocationMetricTable) Reset() {
-	t.GlobalAdmin = 0
-	t.PerspectiveLocationID = 0
-	t.Destinations = nil
-	t.missingLookups.Store(0)
+// InstallLocationMetric atomically swaps the installed table. Passing nil
+// disables the comparator. The caller is responsible for triggering the
+// full best-path recomputation that a swap on a live server requires (D-066).
+func InstallLocationMetric(t *LocationMetricTable) {
+	locationMetric.Store(t)
+}
+
+// ResetLocationMetric removes the installed table (test helper).
+func ResetLocationMetric() {
+	locationMetric.Store(nil)
+}
+
+func (t *LocationMetricTable) Enabled() bool {
+	return t != nil && t.GlobalAdmin != 0 && t.PerspectiveLocationID != 0 && len(t.Destinations) > 0
 }
 
 func (t *LocationMetricTable) MissingLookupCount() uint64 {
+	if t == nil {
+		return 0
+	}
 	return t.missingLookups.Load()
+}
+
+// Equal reports whether two tables rank identically (counter excluded).
+func (t *LocationMetricTable) Equal(o *LocationMetricTable) bool {
+	if t == nil || o == nil {
+		return t == o
+	}
+	return t.GlobalAdmin == o.GlobalAdmin &&
+		t.PerspectiveLocationID == o.PerspectiveLocationID &&
+		maps.Equal(t.Destinations, o.Destinations)
 }
 
 func (t *LocationMetricTable) MetricForPath(path *Path) uint32 {
@@ -91,12 +118,13 @@ func locationIDFromPath(path *Path, globalAdmin uint32) (uint32, bool) {
 }
 
 func compareByLocationMetric(path1, path2 *Path) *Path {
-	if !LocationMetric.Enabled() {
+	t := locationMetric.Load()
+	if !t.Enabled() {
 		return nil
 	}
 
-	m1 := LocationMetric.MetricForPath(path1)
-	m2 := LocationMetric.MetricForPath(path2)
+	m1 := t.MetricForPath(path1)
+	m2 := t.MetricForPath(path2)
 	if m1 == m2 {
 		return nil
 	}

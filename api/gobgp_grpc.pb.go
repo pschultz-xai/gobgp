@@ -99,6 +99,7 @@ const (
 	GoBgpService_UpdateTcpAoKeychain_FullMethodName    = "/api.GoBgpService/UpdateTcpAoKeychain"
 	GoBgpService_DeleteTcpAoKeychain_FullMethodName    = "/api.GoBgpService/DeleteTcpAoKeychain"
 	GoBgpService_ListTcpAoKeychain_FullMethodName      = "/api.GoBgpService/ListTcpAoKeychain"
+	GoBgpService_ReloadLocationMetric_FullMethodName   = "/api.GoBgpService/ReloadLocationMetric"
 )
 
 // GoBgpServiceClient is the client API for GoBgpService service.
@@ -166,6 +167,9 @@ type GoBgpServiceClient interface {
 	UpdateTcpAoKeychain(ctx context.Context, in *UpdateTcpAoKeychainRequest, opts ...grpc.CallOption) (*UpdateTcpAoKeychainResponse, error)
 	DeleteTcpAoKeychain(ctx context.Context, in *DeleteTcpAoKeychainRequest, opts ...grpc.CallOption) (*DeleteTcpAoKeychainResponse, error)
 	ListTcpAoKeychain(ctx context.Context, in *ListTcpAoKeychainRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListTcpAoKeychainResponse], error)
+	// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
+	// location-metric map.
+	ReloadLocationMetric(ctx context.Context, in *ReloadLocationMetricRequest, opts ...grpc.CallOption) (*ReloadLocationMetricResponse, error)
 }
 
 type goBgpServiceClient struct {
@@ -895,6 +899,16 @@ func (c *goBgpServiceClient) ListTcpAoKeychain(ctx context.Context, in *ListTcpA
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type GoBgpService_ListTcpAoKeychainClient = grpc.ServerStreamingClient[ListTcpAoKeychainResponse]
 
+func (c *goBgpServiceClient) ReloadLocationMetric(ctx context.Context, in *ReloadLocationMetricRequest, opts ...grpc.CallOption) (*ReloadLocationMetricResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReloadLocationMetricResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_ReloadLocationMetric_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GoBgpServiceServer is the server API for GoBgpService service.
 // All implementations must embed UnimplementedGoBgpServiceServer
 // for forward compatibility.
@@ -960,6 +974,9 @@ type GoBgpServiceServer interface {
 	UpdateTcpAoKeychain(context.Context, *UpdateTcpAoKeychainRequest) (*UpdateTcpAoKeychainResponse, error)
 	DeleteTcpAoKeychain(context.Context, *DeleteTcpAoKeychainRequest) (*DeleteTcpAoKeychainResponse, error)
 	ListTcpAoKeychain(*ListTcpAoKeychainRequest, grpc.ServerStreamingServer[ListTcpAoKeychainResponse]) error
+	// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
+	// location-metric map.
+	ReloadLocationMetric(context.Context, *ReloadLocationMetricRequest) (*ReloadLocationMetricResponse, error)
 	mustEmbedUnimplementedGoBgpServiceServer()
 }
 
@@ -1146,6 +1163,9 @@ func (UnimplementedGoBgpServiceServer) DeleteTcpAoKeychain(context.Context, *Del
 }
 func (UnimplementedGoBgpServiceServer) ListTcpAoKeychain(*ListTcpAoKeychainRequest, grpc.ServerStreamingServer[ListTcpAoKeychainResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method ListTcpAoKeychain not implemented")
+}
+func (UnimplementedGoBgpServiceServer) ReloadLocationMetric(context.Context, *ReloadLocationMetricRequest) (*ReloadLocationMetricResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReloadLocationMetric not implemented")
 }
 func (UnimplementedGoBgpServiceServer) mustEmbedUnimplementedGoBgpServiceServer() {}
 func (UnimplementedGoBgpServiceServer) testEmbeddedByValue()                      {}
@@ -2121,6 +2141,24 @@ func _GoBgpService_ListTcpAoKeychain_Handler(srv interface{}, stream grpc.Server
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type GoBgpService_ListTcpAoKeychainServer = grpc.ServerStreamingServer[ListTcpAoKeychainResponse]
 
+func _GoBgpService_ReloadLocationMetric_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReloadLocationMetricRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).ReloadLocationMetric(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_ReloadLocationMetric_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).ReloadLocationMetric(ctx, req.(*ReloadLocationMetricRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GoBgpService_ServiceDesc is the grpc.ServiceDesc for GoBgpService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2303,6 +2341,10 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteTcpAoKeychain",
 			Handler:    _GoBgpService_DeleteTcpAoKeychain_Handler,
+		},
+		{
+			MethodName: "ReloadLocationMetric",
+			Handler:    _GoBgpService_ReloadLocationMetric_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -110,6 +110,10 @@ service GoBgpService {
   rpc UpdateTcpAoKeychain(UpdateTcpAoKeychainRequest) returns (UpdateTcpAoKeychainResponse);
   rpc DeleteTcpAoKeychain(DeleteTcpAoKeychainRequest) returns (DeleteTcpAoKeychainResponse);
   rpc ListTcpAoKeychain(ListTcpAoKeychainRequest) returns (stream ListTcpAoKeychainResponse);
+
+  // Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
+  // location-metric map.
+  rpc ReloadLocationMetric(ReloadLocationMetricRequest) returns (ReloadLocationMetricResponse);
 }
 
 message StartBgpRequest {
@@ -1522,4 +1526,34 @@ message TcpAoKeyState {
   bool receive_next = 4;
   uint64 packets_good = 5;
   uint64 packets_bad = 6;
+}
+
+// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
+// location-metric map. Re-reads and registry-validates the map, swaps it
+// atomically, and runs a full best-path recomputation with minimal
+// re-export (same operation class as a policy soft-reset). On validation
+// failure the running map is kept and the RPC returns the error.
+message ReloadLocationMetricRequest {
+  // Optional overrides; when empty, the paths gobgpd was started with
+  // (--location-metric-file / --location-registry-file) are re-read.
+  string map_path = 1;
+  string registry_path = 2;
+  // Validate and report without applying (side-effect-free).
+  bool dry_run = 3;
+}
+
+message ReloadLocationMetricResponse {
+  uint32 perspective_location_id = 1;
+  // Rows in the validated map's destinations table.
+  uint32 metric_rows = 2;
+  // False when the re-read map ranks identically to the running table;
+  // the RIB walk is skipped in that case.
+  bool map_changed = 3;
+  // Destinations examined / destinations whose ranked order changed.
+  uint64 rib_destinations = 4;
+  uint64 reranked_destinations = 5;
+  // UPDATE messages queued to peers as a result of the re-rank.
+  uint64 announced_paths = 6;
+  uint64 withdrawn_paths = 7;
+  uint64 duration_ms = 8;
 }

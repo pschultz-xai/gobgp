@@ -2588,3 +2588,21 @@ func (s *server) ListTcpAoKeychain(r *api.ListTcpAoKeychainRequest, stream api.G
 	}
 	return err
 }
+
+// Bendrr fork (D-066): explicit-trigger reload of the D-014 location-metric map.
+func (s *server) ReloadLocationMetric(ctx context.Context, r *api.ReloadLocationMetricRequest) (*api.ReloadLocationMetricResponse, error) {
+	stats, err := s.bgpServer.ReloadLocationMetric(r.MapPath, r.RegistryPath, r.DryRun)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	return &api.ReloadLocationMetricResponse{
+		PerspectiveLocationId: stats.PerspectiveLocationID,
+		MetricRows:            uint32(stats.MetricRows),
+		MapChanged:            stats.MapChanged,
+		RibDestinations:       uint64(stats.RibDestinations),
+		RerankedDestinations:  uint64(stats.RerankedDestinations),
+		AnnouncedPaths:        uint64(stats.AnnouncedPaths),
+		WithdrawnPaths:        uint64(stats.WithdrawnPaths),
+		DurationMs:            uint64(stats.Duration.Milliseconds()),
+	}, nil
+}
