@@ -421,114 +421,119 @@ func (dest *destination) implicitWithdraw(logger *slog.Logger, newPath *Path) *P
 	return nil
 }
 
+// rankBetterPath runs the full best-path comparator chain over one pair and
+// returns the preferred path, or nil on a complete tie. This is the single
+// definition of the ranking used by both the incremental insertSort and the
+// full reSort a D-066 location-metric reload performs.
+//
+//	Best path processing will involve following steps:
+//	1.  Select a path with a reachable next hop.
+//	2.  Select the path with the highest weight.
+//	3.  If path weights are the same, select the path with the highest
+//	local preference value.
+//	4.  Prefer locally originated routes (network routes, redistributed
+//	routes, or aggregated routes) over received routes.
+//	5.  Select the route with the shortest AS-path length.
+//	6.  If all paths have the same AS-path length, select the path based
+//	on origin: IGP is preferred over EGP; EGP is preferred over
+//	Incomplete.
+//	7.  If the origins are the same, select the path with lowest MED
+//	value.
+//	8.  If the paths have the same MED values, select the path learned
+//	via EBGP over one learned via IBGP.
+//	9.  Select the route with the lowest IGP cost to the next hop.
+//	10. Select the route received from the peer with the lowest BGP
+//	router ID.
+//
+//	Assumes paths from NC has source equal to None.
+func rankBetterPath(path1, path2 *Path) *Path {
+	if b := compareByLLGRStaleCommunity(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByReachableNexthop(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByLocalPref(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByLocalOrigin(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByASPath(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByOrigin(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByMED(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByASNumber(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByLocationMetric(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByAge(path1, path2); b != nil {
+		return b
+	}
+	if b, _ := compareByRouterID(path1, path2); b != nil {
+		return b
+	}
+	if b := compareByNeighborAddress(path1, path2); b != nil {
+		return b
+	}
+	return nil
+}
+
 func (dest *destination) insertSort(newPath *Path) {
-	// Find the correct position for newPath
+	// Find the correct position for newPath. The slice is assumed to be in
+	// descending order: most preferred to least. On a complete tie the new
+	// path is inserted before the equal element (matching historical
+	// behavior).
 	insertIdx := sort.Search(len(dest.knownPathList), func(i int) bool {
-		//Determine where in the array newPath belongs. The slice
-		//is assumed to be in descending order: most preferred to least.
-		//
-		//	Best path processing will involve following steps:
-		//	1.  Select a path with a reachable next hop.
-		//	2.  Select the path with the highest weight.
-		//	3.  If path weights are the same, select the path with the highest
-		//	local preference value.
-		//	4.  Prefer locally originated routes (network routes, redistributed
-		//	routes, or aggregated routes) over received routes.
-		//	5.  Select the route with the shortest AS-path length.
-		//	6.  If all paths have the same AS-path length, select the path based
-		//	on origin: IGP is preferred over EGP; EGP is preferred over
-		//	Incomplete.
-		//	7.  If the origins are the same, select the path with lowest MED
-		//	value.
-		//	8.  If the paths have the same MED values, select the path learned
-		//	via EBGP over one learned via IBGP.
-		//	9.  Select the route with the lowest IGP cost to the next hop.
-		//	10. Select the route received from the peer with the lowest BGP
-		//	router ID.
-		//
-		//	Returns None if best-path among given paths cannot be computed else best
-		//	path.
-		//	Assumes paths from NC has source equal to None.
-		//
-		path1 := newPath
-		path2 := dest.knownPathList[i]
-
-		if b := compareByLLGRStaleCommunity(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByReachableNexthop(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByLocalPref(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByLocalOrigin(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByASPath(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByOrigin(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByMED(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByASNumber(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByLocationMetric(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByAge(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b, _ := compareByRouterID(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByNeighborAddress(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-		return true
+		return rankBetterPath(newPath, dest.knownPathList[i]) != dest.knownPathList[i]
 	})
 
 	// Insert at the found position
 	dest.knownPathList = slices.Insert(dest.knownPathList, insertIdx, newPath)
+}
+
+// reSort fully re-sorts knownPathList under the current comparator chain and
+// reports whether the order changed. Needed when a global comparator input
+// changes out from under already-sorted lists — the D-066 location-metric
+// map reload — because insertSort relies on the sorted invariant for every
+// future incremental update. The sort is stable, so paths that tie keep
+// their current relative order and an unchanged comparator input yields no
+// reported change.
+//
+// INTERNAL USE ONLY: caller MUST hold the appropriate shard lock and must
+// NEVER call this on snapshot destinations.
+func (dest *destination) reSort() (*Update, bool) {
+	oldKnownPathList := make([]*Path, len(dest.knownPathList))
+	copy(oldKnownPathList, dest.knownPathList)
+
+	sort.SliceStable(dest.knownPathList, func(i, j int) bool {
+		return rankBetterPath(dest.knownPathList[i], dest.knownPathList[j]) == dest.knownPathList[i]
+	})
+
+	changed := false
+	for i, p := range dest.knownPathList {
+		if oldKnownPathList[i] != p {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+
+	l := make([]*Path, len(dest.knownPathList))
+	copy(l, dest.knownPathList)
+	return &Update{
+		KnownPathList:    l,
+		OldKnownPathList: oldKnownPathList,
+	}, true
 }
 
 type Update struct {
