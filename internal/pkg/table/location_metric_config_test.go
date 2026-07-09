@@ -67,11 +67,17 @@ func TestLoadLocationMetricFile_valid(t *testing.T) {
 	mapPath := writeTempYAML(t, "metric.yaml", validMetricYAML)
 	require.NoError(t, LoadLocationMetricFile(mapPath, ""))
 
-	assert.True(t, LocationMetric.Enabled())
-	assert.Equal(t, uint32(64500), LocationMetric.GlobalAdmin)
-	assert.Equal(t, uint32(104), LocationMetric.PerspectiveLocationID)
-	assert.Equal(t, uint32(50), LocationMetric.Destinations[102])
-	assert.Equal(t, uint32(120), LocationMetric.Destinations[185])
+	tbl := CurrentLocationMetric()
+	assert.True(t, tbl.Enabled())
+	assert.Equal(t, uint32(64500), tbl.GlobalAdmin)
+	assert.Equal(t, uint32(104), tbl.PerspectiveLocationID)
+	assert.Equal(t, uint32(50), tbl.Destinations[102])
+	assert.Equal(t, uint32(120), tbl.Destinations[185])
+
+	// The startup load records the mounted paths for the D-066 reload.
+	recordedMap, recordedReg := LocationMetricPaths()
+	assert.Equal(t, mapPath, recordedMap)
+	assert.Equal(t, "", recordedReg)
 }
 
 func TestLoadLocationMetricFile_withRegistry(t *testing.T) {
@@ -80,7 +86,7 @@ func TestLoadLocationMetricFile_withRegistry(t *testing.T) {
 	mapPath := writeTempYAML(t, "metric.yaml", validMetricYAML)
 	regPath := writeTempYAML(t, "registry.yaml", validRegistryYAML)
 	require.NoError(t, LoadLocationMetricFile(mapPath, regPath))
-	assert.True(t, LocationMetric.Enabled())
+	assert.True(t, CurrentLocationMetric().Enabled())
 }
 
 func TestLoadLocationMetricFile_ownRowStrippedNotStored(t *testing.T) {
@@ -100,7 +106,7 @@ destinations:
 `)
 	require.NoError(t, LoadLocationMetricFile(mapPath, ""))
 
-	_, hasOwnRow := LocationMetric.Destinations[104]
+	_, hasOwnRow := CurrentLocationMetric().Destinations[104]
 	assert.False(t, hasOwnRow)
 }
 

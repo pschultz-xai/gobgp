@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"gopkg.in/yaml.v3"
 )
@@ -46,44 +47,56 @@ type locationRegistryFile struct {
 	Location    map[uint32]string `yaml:"location"`
 }
 
-// LoadLocationMetricFile parses and validates the mounted location-metric map
-// and installs it into the process-global LocationMetric table. registryPath
-// is optional (""); when given, the map is cross-checked against the location
-// registry so a missing or unknown location fails startup instead of
-// surfacing later as an unexplained ranking anomaly (D-014).
-//
-// Must be called before the BGP server starts serving; the table is read-only
-// afterwards.
-func LoadLocationMetricFile(mapPath, registryPath string) error {
+// locationMetricPaths remembers the mounted file paths from the startup load
+// so an explicit reload (D-066) re-reads the same artifacts.
+var locationMetricPaths atomic.Pointer[[2]string]
+
+// LocationMetricPaths returns the (mapPath, registryPath) recorded by
+// LoadLocationMetricFile, or ("", "") when no map was mounted at startup.
+func LocationMetricPaths() (string, string) {
+	p := locationMetricPaths.Load()
+	if p == nil {
+		return "", ""
+	}
+	return p[0], p[1]
+}
+
+// ParseLocationMetricFile parses and validates a location-metric map without
+// installing it. registryPath is optional (""); when given, the map is
+// cross-checked against the location registry so a missing or unknown
+// location fails loudly instead of surfacing later as an unexplained ranking
+// anomaly (D-014). Used by both the startup load (fail-fast) and the D-066
+// reload (fail-safe: caller keeps the running table on error).
+func ParseLocationMetricFile(mapPath, registryPath string) (*LocationMetricTable, error) {
 	raw, err := os.ReadFile(mapPath)
 	if err != nil {
-		return fmt.Errorf("location-metric: reading %s: %w", mapPath, err)
+		return nil, fmt.Errorf("location-metric: reading %s: %w", mapPath, err)
 	}
 
 	var f locationMetricFile
 	if err := yaml.Unmarshal(raw, &f); err != nil {
-		return fmt.Errorf("location-metric: parsing %s: %w", mapPath, err)
+		return nil, fmt.Errorf("location-metric: parsing %s: %w", mapPath, err)
 	}
 
 	if f.GlobalAdmin == 0 {
-		return fmt.Errorf("location-metric: %s: global_admin is required and must be nonzero", mapPath)
+		return nil, fmt.Errorf("location-metric: %s: global_admin is required and must be nonzero", mapPath)
 	}
 	if f.PerspectiveLocationID == 0 {
-		return fmt.Errorf("location-metric: %s: perspective_location_id is required and must be nonzero", mapPath)
+		return nil, fmt.Errorf("location-metric: %s: perspective_location_id is required and must be nonzero", mapPath)
 	}
 	if len(f.Destinations) == 0 {
-		return fmt.Errorf("location-metric: %s: destinations map is empty", mapPath)
+		return nil, fmt.Errorf("location-metric: %s: destinations map is empty", mapPath)
 	}
 	for locID, metric := range f.Destinations {
 		if metric >= LocationMetricMissingSentinel {
-			return fmt.Errorf("location-metric: %s: destination %d metric %d collides with reserved sentinel range (>= %d)",
+			return nil, fmt.Errorf("location-metric: %s: destination %d metric %d collides with reserved sentinel range (>= %d)",
 				mapPath, locID, metric, LocationMetricMissingSentinel)
 		}
 	}
 
 	if registryPath != "" {
 		if err := validateAgainstRegistry(&f, registryPath); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -96,10 +109,24 @@ func LoadLocationMetricFile(mapPath, registryPath string) error {
 	// harmless but must not override the 0 default.
 	delete(dests, f.PerspectiveLocationID)
 
-	LocationMetric.Reset()
-	LocationMetric.GlobalAdmin = f.GlobalAdmin
-	LocationMetric.PerspectiveLocationID = f.PerspectiveLocationID
-	LocationMetric.Destinations = dests
+	return &LocationMetricTable{
+		GlobalAdmin:           f.GlobalAdmin,
+		PerspectiveLocationID: f.PerspectiveLocationID,
+		Destinations:          dests,
+	}, nil
+}
+
+// LoadLocationMetricFile parses, validates and installs the mounted
+// location-metric map (startup path). Must be called before the BGP server
+// starts serving; afterwards the table only changes via the D-066 reload,
+// which swaps it atomically and recomputes best paths.
+func LoadLocationMetricFile(mapPath, registryPath string) error {
+	t, err := ParseLocationMetricFile(mapPath, registryPath)
+	if err != nil {
+		return err
+	}
+	InstallLocationMetric(t)
+	locationMetricPaths.Store(&[2]string{mapPath, registryPath})
 	return nil
 }
 
