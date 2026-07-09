@@ -784,12 +784,7 @@ func TestPropagateUpdateSerializesConcurrentLiveDeltas(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	sentPathCount := 0
-	target.sentPaths.Range(func(_, _ any) bool {
-		sentPathCount++
-		return true
-	})
-	require.Equal(t, pathCount, sentPathCount)
+	require.Equal(t, pathCount, target.advertisedDestinationCount())
 }
 
 // TestHandleFSMMessage_LLGREndChsRace tests concurrent append and reset of llgrEndChs slice
