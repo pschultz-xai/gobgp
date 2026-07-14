@@ -30,6 +30,9 @@ package server
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -40,6 +43,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // assignRejectAllExport pins the D-031 stage A wire suppress: a policy
@@ -181,7 +186,7 @@ func TestShadowWouldExportEvaluatesStagedPolicy(t *testing.T) {
 
 	wouldExportIDs := func(policyName string) []uint32 {
 		ids := []uint32{}
-		err := pod.WouldExport(WouldExportRequest{
+		err := pod.WouldExport(context.Background(), WouldExportRequest{
 			PeerAddress: "127.0.0.1",
 			Family:      bgp.RF_IPv4_UC,
 			PolicyName:  policyName,
@@ -245,16 +250,113 @@ func TestShadowWouldExportEvaluatesStagedPolicy(t *testing.T) {
 	assert.Equal(t, []uint32{20, 30}, wouldExportIDs("staged-active"),
 		"staged policy filters must apply before the SendMax cut")
 
-	// An unknown staged policy must error, not silently accept-all.
-	err = pod.WouldExport(WouldExportRequest{
+	// An unknown staged policy must error, not silently accept-all — and it
+	// must error even when nothing would match (up-front existence check).
+	err = pod.WouldExport(context.Background(), WouldExportRequest{
 		PeerAddress: "127.0.0.1",
 		Family:      bgp.RF_IPv4_UC,
 		PolicyName:  "no-such-policy",
 	}, func(bgp.NLRI, []*apiutil.Path) {})
 	assert.Error(t, err)
 
+	// A cancelled caller context stops the walk instead of running the
+	// evaluation to completion (the U2/U5 lesson: abandoned expensive
+	// reads must not keep burning).
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = pod.WouldExport(cancelled, WouldExportRequest{
+		PeerAddress: "127.0.0.1",
+		Family:      bgp.RF_IPv4_UC,
+	}, func(bgp.NLRI, []*apiutil.Path) {
+		t.Error("cancelled context must not deliver results")
+	})
+	assert.ErrorIs(t, err, context.Canceled)
+
 	// The simulation must not have leaked anything onto the wire.
 	assert.Empty(t, receivedLocationIDs(t, router), "would-export must not transmit")
+}
+
+// TestGRPCWouldExportStreamsStagedSet pins the D-031 gRPC surface: the
+// WouldExport RPC streams the same staged export set the in-process API
+// reports, over a real gRPC connection, while the wire stays suppressed.
+func TestGRPCWouldExportStreamsStagedSet(t *testing.T) {
+	mountLocationMetricTable(t, map[uint32]uint32{
+		10: 5,
+		20: 10,
+		30: 20,
+	})
+
+	socketDir, err := os.MkdirTemp("", "gobgp-would-export-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketAddr := "unix://" + socketDir + "/gobgp.sock"
+
+	pod, router := startLocationMetricPair(t, 2, GrpcListenAddress(socketAddr))
+	assignRejectAllExport(t, pod)
+
+	injectLocationCandidate(t, pod, 30, 1)
+	injectLocationCandidate(t, pod, 20, 2)
+	injectLocationCandidate(t, pod, 10, 3)
+
+	conn, err := grpc.NewClient(socketAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	client := api.NewGoBgpServiceClient(conn)
+
+	rpcWouldExportIDs := func(policyName string, batchSize uint64) ([]uint32, error) {
+		stream, err := client.WouldExport(context.Background(), &api.WouldExportRequest{
+			PeerAddress: "127.0.0.1",
+			Family:      &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST},
+			PolicyName:  policyName,
+			BatchSize:   batchSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		ids := []uint32{}
+		for {
+			resp, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return ids, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			d := resp.GetDestination()
+			if d.GetPrefix() != lmTestPrefix {
+				continue
+			}
+			for _, p := range d.GetPaths() {
+				for _, attr := range p.GetPattrs() {
+					lcs := attr.GetLargeCommunities()
+					if lcs == nil {
+						continue
+					}
+					for _, lc := range lcs.Communities {
+						if lc.GlobalAdmin == lmTestGlobalAdmin && lc.LocalData1 == table.LocationLCDimension {
+							ids = append(ids, lc.LocalData2)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Ranked top-SendMax set, streamed over gRPC; batch_size 1 exercises
+	// the mid-stream flush path.
+	ids, err := rpcWouldExportIDs("", 0)
+	require.NoError(t, err)
+	assert.Equal(t, []uint32{10, 20}, ids)
+	ids, err = rpcWouldExportIDs("", 1)
+	require.NoError(t, err)
+	assert.Equal(t, []uint32{10, 20}, ids)
+
+	// Unknown staged policy surfaces as an RPC error.
+	_, err = rpcWouldExportIDs("no-such-policy", 0)
+	assert.Error(t, err)
+
+	// Nothing leaked onto the wire.
+	assert.Empty(t, receivedLocationIDs(t, router), "WouldExport RPC must not transmit")
 }
 
 // TestActiveAdjRibOutReadReflectsRankedExport pins gate 5: in active mode
