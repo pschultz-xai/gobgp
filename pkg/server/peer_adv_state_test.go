@@ -6,12 +6,14 @@
 package server
 
 import (
+	"context"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/osrg/gobgp/v4/api"
 	"github.com/osrg/gobgp/v4/internal/pkg/table"
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
@@ -75,10 +77,13 @@ func TestAdvertisedStateNonAddPath(t *testing.T) {
 	require.True(t, p.hasPathAlreadyBeenSent(p2))
 	require.Equal(t, uint8(1), p.getRoutesCount(bgp.RF_IPv4_UC, p1.GetPrefix()))
 	require.Equal(t, 1, p.advertisedDestinationCount())
+	require.Equal(t, uint64(1), p.getSentPathsCount(bgp.RF_IPv4_UC))
+	require.Zero(t, p.getSentPathsCount(bgp.RF_IPv6_UC))
 
 	// Re-advertising via another path of the same destination is idempotent.
 	p.updateRoutes(p2)
 	require.Equal(t, uint8(1), p.getRoutesCount(bgp.RF_IPv4_UC, p1.GetPrefix()))
+	require.Equal(t, uint64(1), p.getSentPathsCount(bgp.RF_IPv4_UC))
 
 	// A withdraw for the destination clears the flag and drops the entry.
 	p.updateRoutes(p1.Clone(true))
@@ -86,11 +91,16 @@ func TestAdvertisedStateNonAddPath(t *testing.T) {
 	require.False(t, p.hasPathAlreadyBeenSent(p2))
 	require.Equal(t, uint8(0), p.getRoutesCount(bgp.RF_IPv4_UC, p1.GetPrefix()))
 	require.Empty(t, p.advRoutes)
+	require.Zero(t, p.getSentPathsCount(bgp.RF_IPv4_UC))
 
 	// EOR and nil paths are ignored, and withdraws for unknown destinations
-	// are no-ops (the old map deleted from an absent entry).
+	// are no-ops (the old map deleted from an absent entry); none of them
+	// may drive the sent-path count negative.
 	p.updateRoutes(nil, table.NewEOR(bgp.RF_IPv4_UC), p2.Clone(true))
 	require.Empty(t, p.advRoutes)
+	require.Zero(t, p.getSentPathsCount(bgp.RF_IPv4_UC))
+	p.updateRoutes(p1)
+	require.Equal(t, uint64(1), p.getSentPathsCount(bgp.RF_IPv4_UC))
 }
 
 func TestAdvertisedStateAddPath(t *testing.T) {
@@ -113,6 +123,7 @@ func TestAdvertisedStateAddPath(t *testing.T) {
 	}
 	require.Equal(t, uint8(3), p.getRoutesCount(bgp.RF_IPv4_UC, p1.GetPrefix()))
 	require.Equal(t, 1, p.advertisedDestinationCount())
+	require.Equal(t, uint64(3), p.getSentPathsCount(bgp.RF_IPv4_UC))
 
 	// Withdrawing one path (as a clone, matching the real call sites) clears
 	// only that path's flag; clones share the original's localID.
@@ -121,6 +132,7 @@ func TestAdvertisedStateAddPath(t *testing.T) {
 	require.False(t, p.hasPathAlreadyBeenSent(p2))
 	require.True(t, p.hasPathAlreadyBeenSent(p3))
 	require.Equal(t, uint8(2), p.getRoutesCount(bgp.RF_IPv4_UC, p1.GetPrefix()))
+	require.Equal(t, uint64(2), p.getSentPathsCount(bgp.RF_IPv4_UC))
 
 	// SendMax-filtered flags are per path and independent of the sent flags.
 	require.False(t, p.isPathSendMaxFiltered(p3))
@@ -140,6 +152,7 @@ func TestAdvertisedStateAddPath(t *testing.T) {
 	require.Equal(t, uint8(0), p.getRoutesCount(bgp.RF_IPv4_UC, p1.GetPrefix()))
 	require.Empty(t, p.advRoutes)
 	require.Empty(t, p.advOverflow)
+	require.Zero(t, p.getSentPathsCount(bgp.RF_IPv4_UC))
 
 	// resetAdvertisedRoutes clears everything at once.
 	p.updateRoutes(p1)
@@ -148,6 +161,7 @@ func TestAdvertisedStateAddPath(t *testing.T) {
 	require.False(t, p.hasPathAlreadyBeenSent(p1))
 	require.False(t, p.isPathSendMaxFiltered(p2))
 	require.Empty(t, p.advRoutes)
+	require.Zero(t, p.getSentPathsCount(bgp.RF_IPv4_UC))
 }
 
 // TestAdvertisedStateOverflow exercises destinations with more than
@@ -172,6 +186,9 @@ func TestAdvertisedStateOverflow(t *testing.T) {
 	require.NotEmpty(t, p.advOverflow)
 	require.True(t, p.hasPathAlreadyBeenSent(overflowPath))
 	require.Equal(t, 1, p.advertisedDestinationCount())
+	// The full sent-path count spans inline and overflow bookkeeping and,
+	// unlike getRoutesCount, does not clamp at the uint8 maximum.
+	require.Equal(t, uint64(n), p.getSentPathsCount(bgp.RF_IPv4_UC))
 	// n sent paths clamp to the uint8 maximum, as with len() on the old set.
 	require.Equal(t, uint8(255), p.getRoutesCount(bgp.RF_IPv4_UC, overflowPath.GetPrefix()))
 
@@ -183,6 +200,7 @@ func TestAdvertisedStateOverflow(t *testing.T) {
 
 	p.updateRoutes(overflowPath.Clone(true))
 	require.False(t, p.hasPathAlreadyBeenSent(overflowPath))
+	require.Equal(t, uint64(n-1), p.getSentPathsCount(bgp.RF_IPv4_UC))
 
 	// Withdrawing everything drains both maps.
 	for _, path := range paths {
@@ -191,4 +209,88 @@ func TestAdvertisedStateOverflow(t *testing.T) {
 	require.Equal(t, uint8(0), p.getRoutesCount(bgp.RF_IPv4_UC, overflowPath.GetPrefix()))
 	require.Empty(t, p.advRoutes)
 	require.Empty(t, p.advOverflow)
+	require.Zero(t, p.getSentPathsCount(bgp.RF_IPv4_UC))
+}
+
+// TestListPeerAdvertisedCount verifies that ListPeer with EnableAdvertised
+// reports the advertised-route count from the peer's RIB-out bookkeeping
+// (paths actually sent) without walking the Loc-RIB, and that it honors
+// context cancellation inside the management operation (Bendrr U2).
+func TestListPeerAdvertisedCount(t *testing.T) {
+	s := NewBgpServer()
+	go s.Serve()
+
+	err := s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        65001,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	require.NoError(t, err)
+
+	peerAddr := netip.MustParseAddr("10.0.0.1")
+	target := newPeerandInfo(t, 65001, 65002, peerAddr.String(), s.globalRib)
+	target.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED)
+	target.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{
+		bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_NONE,
+	})
+	// toConfig serializes the received OPEN of established peers.
+	recvOpen, err := bgp.NewBGPOpenMessage(65002, 90, peerAddr, nil)
+	require.NoError(t, err)
+	target.fsm.recvOpen = recvOpen
+
+	err = s.mgmtOperation(func() error {
+		s.neighborMap[peerAddr] = target
+		return nil
+	}, true)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := s.mgmtOperation(func() error {
+			delete(s.neighborMap, peerAddr)
+			return nil
+		}, false)
+		require.NoError(t, err)
+		cleanInfiniteChannel(target.fsm.outgoingCh)
+		require.NoError(t, s.StopBgp(context.Background(), &api.StopBgpRequest{}))
+	})
+
+	const pathCount = 16
+	for i := range pathCount {
+		prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(i)}), 32).String()
+		s.propagateUpdate(nil, []*table.Path{makePath(t, prefix, "192.0.2.254", 0)})
+	}
+
+	getAdvertised := func(t *testing.T) uint64 {
+		t.Helper()
+		var advertised uint64
+		found := false
+		err := s.ListPeer(context.Background(), &api.ListPeerRequest{EnableAdvertised: true}, func(p *api.Peer) {
+			for _, afiSafi := range p.GetAfiSafis() {
+				state := afiSafi.GetState()
+				if state.GetFamily().GetAfi() == api.Family_AFI_IP && state.GetFamily().GetSafi() == api.Family_SAFI_UNICAST {
+					advertised = state.GetAdvertised()
+					found = true
+				}
+			}
+		})
+		require.NoError(t, err)
+		require.True(t, found)
+		return advertised
+	}
+
+	require.Equal(t, uint64(pathCount), getAdvertised(t))
+
+	// Withdrawing one path is reflected without a session reset.
+	prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 0, 2, 0}), 32).String()
+	s.propagateUpdate(nil, []*table.Path{makePath(t, prefix, "192.0.2.254", 0).Clone(true)})
+	require.Equal(t, uint64(pathCount-1), getAdvertised(t))
+
+	// A caller that has gone away is noticed inside the mgmt operation.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = s.ListPeer(cancelled, &api.ListPeerRequest{EnableAdvertised: true}, func(p *api.Peer) {
+		t.Error("callback invoked for cancelled context")
+	})
+	require.ErrorIs(t, err, context.Canceled)
 }
