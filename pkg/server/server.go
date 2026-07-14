@@ -202,7 +202,6 @@ func NewBgpServer(opt ...ServerOption) *BgpServer {
 	s.bfdServer = NewBfdServer(s, logger)
 	s.keychainStore = newTcpAoKeychainStore()
 	if len(opts.grpcAddress) != 0 {
-		grpc.EnableTracing = false
 		s.apiServer = newAPIserver(s, shared, grpc.NewServer(opts.grpcOption...), opts.grpcAddress)
 		go func() {
 			if err := s.apiServer.serve(); err != nil {
