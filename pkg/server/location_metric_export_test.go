@@ -56,14 +56,15 @@ func mountLocationMetricTable(t *testing.T, destinations map[uint32]uint32) {
 
 // startLocationMetricPair starts the pod-side server (s1, exporter with
 // SendMax) and the router-side server (s2, ADD-PATH receiver) as iBGP
-// peers, and blocks until the session is established.
-func startLocationMetricPair(t *testing.T, sendMax uint8) (pod *BgpServer, router *BgpServer) {
+// peers, and blocks until the session is established. podOpts apply to the
+// pod-side server (e.g. GrpcListenAddress for gRPC-level tests).
+func startLocationMetricPair(t *testing.T, sendMax uint8, podOpts ...ServerOption) (pod *BgpServer, router *BgpServer) {
 	t.Helper()
 
 	const asn = 65001
 	const listenPort = 10179
 
-	pod = NewBgpServer()
+	pod = NewBgpServer(podOpts...)
 	go pod.Serve()
 	err := pod.StartBgp(context.Background(), &api.StartBgpRequest{
 		Global: &api.Global{
