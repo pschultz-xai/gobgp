@@ -3975,6 +3975,17 @@ func (r *RoutingPolicy) ApplyPolicyByName(name string, before *Path, options *Po
 	return after, nil
 }
 
+// HasPolicy reports whether a policy with the given name is defined.
+//
+// Bendrr fork (D-031): lets the would-export evaluator reject an unknown
+// staged policy up front, before streaming any results.
+func (r *RoutingPolicy) HasPolicy(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.policyMap[name]
+	return ok
+}
+
 func (r *RoutingPolicy) getPolicy(id string, dir PolicyDirection) []*Policy {
 	a, ok := r.assignmentMap[id]
 	if !ok {

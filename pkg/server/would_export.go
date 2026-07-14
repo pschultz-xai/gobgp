@@ -25,11 +25,23 @@ package server
 // policy instead of the assigned one, and the D-034 ranked SendMax cap)
 // against the current Loc-RIB without transmitting anything and without
 // touching per-peer advertised-set bookkeeping.
+//
+// Scale discipline (same class as the U2 /metrics fix): the serialized
+// management loop is held only long enough to resolve the peer and snapshot
+// the table's destinations. Policy evaluation — O(Loc-RIB × policy), the
+// expensive part — runs OUTSIDE the loop over immutable destination
+// snapshots, streaming results through fn as it goes and honoring ctx
+// cancellation between destinations. A snapshot of a multi-million-path
+// Loc-RIB therefore does not stall applies; the price is point-in-time
+// consistency (paths applied after the snapshot are not reflected), which
+// is exactly what a membership-based shadow diff (D-042) tolerates.
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
@@ -55,68 +67,80 @@ type WouldExportRequest struct {
 // best-path ranked order (D-014 comparator chain), capped at the peer's
 // ADD-PATH SendMax when ADD-PATH send is negotiated (D-034). Nothing is sent
 // to the peer and no advertised-route state is modified.
-func (s *BgpServer) WouldExport(r WouldExportRequest, fn func(prefix bgp.NLRI, paths []*apiutil.Path)) error {
+//
+// fn streams during the evaluation: it must not block for long and must not
+// call back into the server. Results reflect the Loc-RIB at the moment the
+// destination snapshot was taken; ctx cancellation stops the walk between
+// destinations.
+func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn func(prefix bgp.NLRI, paths []*apiutil.Path)) error {
 	type wouldDest struct {
-		prefix bgp.NLRI
-		paths  []*apiutil.Path
+		nlri       bgp.NLRI
+		candidates []*table.Path
 	}
-	var results []wouldDest
+	var (
+		peer        *peer
+		dests       []wouldDest
+		addPathSend bool
+		sendMax     int
+		validate    func(*table.Path) *table.Validation
+	)
 
+	// Management-loop phase: resolve the peer, validate the request, and
+	// snapshot the table (pointer copies of each destination's ranked
+	// path list). No policy evaluation happens here.
 	err := s.mgmtOperation(func() error {
 		remoteAddr, err := netip.ParseAddr(r.PeerAddress)
 		if err != nil {
 			return fmt.Errorf("failed to parse address: %v", err)
 		}
-		peer, ok := s.neighborMap[remoteAddr]
+		p, ok := s.neighborMap[remoteAddr]
 		if !ok {
 			return fmt.Errorf("neighbor that has %v doesn't exist", r.PeerAddress)
 		}
-		if peer.peerInfo.Load() == nil {
+		if p.peerInfo.Load() == nil {
 			return fmt.Errorf("neighbor %v has no session information yet", r.PeerAddress)
 		}
+		if r.PolicyName != "" && !s.policy.HasPolicy(r.PolicyName) {
+			return fmt.Errorf("not found policy %s", r.PolicyName)
+		}
 
-		tbl, ok := peer.localRib.GetTable(r.Family)
+		tbl, ok := p.localRib.GetTable(r.Family)
 		if !ok {
 			return fmt.Errorf("address family %s is not configured", r.Family)
 		}
 
-		addPathSend := peer.isAddPathSendEnabled(r.Family)
+		peer = p
+		id, as := p.TableID(), p.AS()
+		// GetDestinations returns immutable snapshots (shard-locked copy
+		// of each knownPathList), so the captured path lists are safe to
+		// evaluate without locks below.
+		for _, dst := range tbl.GetDestinations() {
+			dests = append(dests, wouldDest{
+				nlri:       dst.GetNlri(),
+				candidates: dst.GetKnownPathList(id, as),
+			})
+		}
+		addPathSend = p.isAddPathSendEnabled(r.Family)
 		// ADD-PATH send peers get the ranked SendMax set (0 = unlimited,
 		// matching upstream semantics).
-		sendMax := 0
 		if addPathSend {
-			sendMax = int(peer.getAddPathSendMax(r.Family))
+			sendMax = int(p.getAddPathSendMax(r.Family))
 		}
 
-		for _, dst := range tbl.GetDestinations() {
-			var out []*apiutil.Path
-			candidates := dst.GetKnownPathList(peer.TableID(), peer.AS())
-			if !addPathSend && len(candidates) > 1 {
-				// A plain peer is only ever offered the current best path;
-				// if policy rejects it, the runner-up is not substituted.
-				candidates = candidates[:1]
+		// The ROA table is mutated on the serve-loop goroutine (same one
+		// that runs mgmt operations), so it must not be read during the
+		// off-loop evaluation phase. When RPKI is enabled, precompute the
+		// validations here — the validateTable pattern; when it is not
+		// (the common case), policy RPKI conditions never match, exactly
+		// as with a nil Validate.
+		if s.roaManager.enabled() {
+			v := make(map[*table.Path]*table.Validation)
+			for _, dst := range dests {
+				for _, path := range dst.candidates {
+					v[path] = s.roaTable.Validate(path)
+				}
 			}
-			for _, path := range candidates {
-				if sendMax > 0 && len(out) >= sendMax {
-					break
-				}
-				p, options, stop := s.prePolicyFilterpath(peer, path, nil)
-				if stop {
-					continue
-				}
-				options.Validate = s.roaTable.Validate
-				p, err := s.policy.ApplyPolicyByName(r.PolicyName, p, options)
-				if err != nil {
-					return err
-				}
-				if p = s.postFilterpath(peer, p); p == nil {
-					continue
-				}
-				out = append(out, toPathApiUtil(p))
-			}
-			if len(out) > 0 {
-				results = append(results, wouldDest{prefix: dst.GetNlri(), paths: out})
-			}
+			validate = func(p *table.Path) *table.Validation { return v[p] }
 		}
 		return nil
 	}, true)
@@ -124,8 +148,43 @@ func (s *BgpServer) WouldExport(r WouldExportRequest, fn func(prefix bgp.NLRI, p
 		return err
 	}
 
-	for _, d := range results {
-		fn(d.prefix, d.paths)
+	// Evaluation phase, off the management loop. Everything read here is
+	// concurrency-safe: the captured path lists come from immutable
+	// destination snapshots, peer config reads go through the pConf atomic
+	// pointer, peerInfo is an atomic Load, and RoutingPolicy application
+	// takes its own read lock.
+	for _, dst := range dests {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var out []*apiutil.Path
+		candidates := dst.candidates
+		if !addPathSend && len(candidates) > 1 {
+			// A plain peer is only ever offered the current best path;
+			// if policy rejects it, the runner-up is not substituted.
+			candidates = candidates[:1]
+		}
+		for _, path := range candidates {
+			if sendMax > 0 && len(out) >= sendMax {
+				break
+			}
+			p, options, stop := s.prePolicyFilterpath(peer, path, nil)
+			if stop {
+				continue
+			}
+			options.Validate = validate
+			p, err := s.policy.ApplyPolicyByName(r.PolicyName, p, options)
+			if err != nil {
+				return err
+			}
+			if p = s.postFilterpath(peer, p); p == nil {
+				continue
+			}
+			out = append(out, toPathApiUtil(p))
+		}
+		if len(out) > 0 {
+			fn(dst.nlri, out)
+		}
 	}
 	return nil
 }
