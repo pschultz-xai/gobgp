@@ -56,8 +56,15 @@ type server struct {
 	api.UnimplementedGoBgpServiceServer
 }
 
-func newAPIserver(b *BgpServer, shared *sharedData, g *grpc.Server, hosts string) *server {
+// grpc.EnableTracing is a package-global; assigning it per constructed
+// server races with running gRPC handlers reading it (caught by -race when
+// two BgpServers with gRPC listeners overlap, e.g. sequential tests).
+// Disable it exactly once, before any server can serve.
+func init() {
 	grpc.EnableTracing = false
+}
+
+func newAPIserver(b *BgpServer, shared *sharedData, g *grpc.Server, hosts string) *server {
 	s := &server{
 		bgpServer:  b,
 		shared:     shared,

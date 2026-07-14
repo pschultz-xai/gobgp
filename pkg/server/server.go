@@ -200,7 +200,6 @@ func NewBgpServer(opt ...ServerOption) *BgpServer {
 	s.mrtManager = newMrtManager(s)
 	s.bfdServer = NewBfdServer(s, logger)
 	if len(opts.grpcAddress) != 0 {
-		grpc.EnableTracing = false
 		s.apiServer = newAPIserver(s, shared, grpc.NewServer(opts.grpcOption...), opts.grpcAddress)
 		go func() {
 			if err := s.apiServer.serve(); err != nil {
