@@ -3338,6 +3338,12 @@ func (s *BgpServer) ListPeer(ctx context.Context, r *api.ListPeerRequest, fn fun
 		getAdvertised := r.EnableAdvertised
 		l = make([]*api.Peer, 0, len(s.neighborMap))
 		for k, peer := range s.neighborMap {
+			// Stop early if the caller has gone away (e.g. an expired
+			// Prometheus scrape); otherwise an abandoned request keeps
+			// occupying the serialized mgmt loop.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			conf := peer.fsm.pConf.ReadOnly()
 			neighborIface := conf.Config.NeighborInterface
 			if address != "" && address != k.String() && address != neighborIface {
@@ -3362,9 +3368,13 @@ func (s *BgpServer) ListPeer(ctx context.Context, r *api.ListPeerRequest, fn fun
 							received = uint64(peer.adjRibIn.Count(flist))
 							accepted = uint64(peer.adjRibIn.Accepted(flist))
 							if getAdvertised {
-								s.getBestFromLocalCallback(peer, flist, false, false, func(paths []*table.Path, filtered []*table.Path) {
-									advertised = uint64(len(paths))
-								})
+								// Served from the peer's RIB-out bookkeeping
+								// (the paths actually advertised) instead of
+								// re-evaluating export policy against the
+								// whole Loc-RIB, which is O(RIB) per peer and
+								// family inside the mgmt loop and starves it
+								// on large RIBs (e.g. Prometheus scrapes).
+								advertised = peer.getSentPathsCount(family)
 							}
 						}
 						p.AfiSafis[i].State = &api.AfiSafiState{

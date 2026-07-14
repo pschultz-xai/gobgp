@@ -115,6 +115,12 @@ type peer struct {
 	// getRoutesCount, hasPathAlreadyBeenSent) MUST be called under the
 	// bucket lock for that prefix (sharedData.propagateBucket).
 	sentPaths sync.Map
+	// map[bgp.Family]*atomic.Int64 counting the paths currently recorded in
+	// sentPaths per family. Kept in sync by updateRoutes and
+	// resetAdvertisedRoutes so the advertised-route count can be served in
+	// O(1) (ListPeer with EnableAdvertised, e.g. the Prometheus collector)
+	// instead of recomputing the peer's export set from the Loc-RIB.
+	sentPathsCount sync.Map
 	// map[table.PathLocalKey]struct{}
 	sendMaxPathFiltered sync.Map
 	llgrEndChs          []chan struct{} // protected by fsm.lock
@@ -269,7 +275,10 @@ func (peer *peer) updateRoutes(paths ...*table.Path) {
 		identifiersValue, destExists := peer.sentPaths.Load(destLocalKey)
 		if path.IsWithdraw && destExists {
 			identifiers := identifiersValue.(pathIDSet)
-			delete(identifiers, pathID)
+			if _, sent := identifiers[pathID]; sent {
+				delete(identifiers, pathID)
+				peer.addSentPathsCount(destLocalKey.Family, -1)
+			}
 			if len(identifiers) == 0 {
 				peer.sentPaths.Delete(destLocalKey)
 			}
@@ -280,13 +289,41 @@ func (peer *peer) updateRoutes(paths ...*table.Path) {
 			} else {
 				identifiers = make(pathIDSet)
 			}
-			identifiers[pathID] = struct{}{}
+			if _, sent := identifiers[pathID]; !sent {
+				identifiers[pathID] = struct{}{}
+				peer.addSentPathsCount(destLocalKey.Family, 1)
+			}
 			if !destExists {
 				// store only the first insert, mutations are inplace
 				peer.sentPaths.Store(destLocalKey, identifiers)
 			}
 		}
 	}
+}
+
+// addSentPathsCount adjusts the per-family count of paths recorded in
+// sentPaths. Callers hold the propagation bucket lock for the affected
+// prefix, but different prefixes update concurrently, hence the atomic.
+func (peer *peer) addSentPathsCount(family bgp.Family, delta int64) {
+	counter, ok := peer.sentPathsCount.Load(family)
+	if !ok {
+		counter, _ = peer.sentPathsCount.LoadOrStore(family, new(atomic.Int64))
+	}
+	counter.(*atomic.Int64).Add(delta)
+}
+
+// getSentPathsCount returns the number of paths currently advertised to the
+// peer for family, served from bookkeeping maintained on the update path so
+// it never walks the RIB.
+func (peer *peer) getSentPathsCount(family bgp.Family) uint64 {
+	counter, ok := peer.sentPathsCount.Load(family)
+	if !ok {
+		return 0
+	}
+	if n := counter.(*atomic.Int64).Load(); n > 0 {
+		return uint64(n)
+	}
+	return 0
 }
 
 func (peer *peer) isPathSendMaxFiltered(path *table.Path) bool {
@@ -330,6 +367,7 @@ func (peer *peer) hasPathAlreadyBeenSent(path *table.Path) bool {
 
 func (peer *peer) resetAdvertisedRoutes() {
 	peer.sentPaths.Clear()
+	peer.sentPathsCount.Clear()
 	peer.sendMaxPathFiltered.Clear()
 }
 
