@@ -149,9 +149,9 @@ type peer struct {
 	// count be served in O(1) (ListPeer with EnableAdvertised, e.g. the
 	// Prometheus collector) instead of recomputing the peer's export set
 	// from the Loc-RIB inside the mgmt loop (Bendrr U2).
-	sentPathsCount map[bgp.Family]int64
-	llgrEndChs  []chan struct{} // protected by fsm.lock
-	longLivedRunning    atomic.Bool
+	sentPathsCount   map[bgp.Family]int64
+	llgrEndChs       []chan struct{} // protected by fsm.lock
+	longLivedRunning atomic.Bool
 	// Route Target Membership handler after import policy (for constrained VPN distribution).
 	rtmHandler *table.RouteTargetMembershipHandler
 	// Route refresh in progress, during an established session or route refresh, this need to be atomic to avoid out of order updates
