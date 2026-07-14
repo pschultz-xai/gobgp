@@ -2589,6 +2589,66 @@ func (s *server) ListTcpAoKeychain(r *api.ListTcpAoKeychainRequest, stream api.G
 	return err
 }
 
+// Bendrr fork (D-031): shadow-mode would-export evaluator. Streams what the
+// named staged export policy would send to one peer, ListPath-style batched;
+// nothing is transmitted and no advertised-set bookkeeping is touched.
+func (s *server) WouldExport(r *api.WouldExportRequest, stream api.GoBgpService_WouldExportServer) error {
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+
+	family := bgp.Family(0)
+	if r.Family != nil {
+		family = bgp.NewFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
+	}
+	batchSize := r.BatchSize
+	if batchSize == 0 {
+		batchSize = defaultListPathBatchSize
+	}
+
+	l := make([]*api.Destination, 0)
+	send := func() error {
+		for _, d := range l {
+			if err := stream.Send(&api.WouldExportResponse{Destination: d}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var sendErr error
+	err := s.bgpServer.WouldExport(ctx, WouldExportRequest{
+		PeerAddress: r.PeerAddress,
+		Family:      family,
+		PolicyName:  r.PolicyName,
+	}, func(prefix bgp.NLRI, paths []*apiutil.Path) {
+		if sendErr != nil || ctx.Err() != nil {
+			return
+		}
+		d := &api.Destination{
+			Prefix: prefix.String(),
+			Paths:  make([]*api.Path, len(paths)),
+		}
+		for i, path := range paths {
+			d.Paths[i] = toPathApi(path, false, false, false)
+		}
+		l = append(l, d)
+		if uint64(len(l)) <= batchSize {
+			return
+		}
+		if sendErr = send(); sendErr != nil {
+			cancel()
+			return
+		}
+		l = l[:0]
+	})
+	if sendErr != nil {
+		return sendErr
+	}
+	if err != nil {
+		return err
+	}
+	return send()
+}
+
 // Bendrr fork (D-066): explicit-trigger reload of the D-014 location-metric map.
 func (s *server) ReloadLocationMetric(ctx context.Context, r *api.ReloadLocationMetricRequest) (*api.ReloadLocationMetricResponse, error) {
 	stats, err := s.bgpServer.ReloadLocationMetric(r.MapPath, r.RegistryPath, r.DryRun)

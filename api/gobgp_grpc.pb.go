@@ -100,6 +100,7 @@ const (
 	GoBgpService_DeleteTcpAoKeychain_FullMethodName    = "/api.GoBgpService/DeleteTcpAoKeychain"
 	GoBgpService_ListTcpAoKeychain_FullMethodName      = "/api.GoBgpService/ListTcpAoKeychain"
 	GoBgpService_ReloadLocationMetric_FullMethodName   = "/api.GoBgpService/ReloadLocationMetric"
+	GoBgpService_WouldExport_FullMethodName            = "/api.GoBgpService/WouldExport"
 )
 
 // GoBgpServiceClient is the client API for GoBgpService service.
@@ -170,6 +171,10 @@ type GoBgpServiceClient interface {
 	// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
 	// location-metric map.
 	ReloadLocationMetric(ctx context.Context, in *ReloadLocationMetricRequest, opts ...grpc.CallOption) (*ReloadLocationMetricResponse, error)
+	// Bendrr fork (D-031): shadow-mode would-export evaluator — what the named
+	// staged export policy would send to one peer if it were the assigned
+	// export policy, without transmitting anything.
+	WouldExport(ctx context.Context, in *WouldExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WouldExportResponse], error)
 }
 
 type goBgpServiceClient struct {
@@ -909,6 +914,25 @@ func (c *goBgpServiceClient) ReloadLocationMetric(ctx context.Context, in *Reloa
 	return out, nil
 }
 
+func (c *goBgpServiceClient) WouldExport(ctx context.Context, in *WouldExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WouldExportResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[15], GoBgpService_WouldExport_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WouldExportRequest, WouldExportResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GoBgpService_WouldExportClient = grpc.ServerStreamingClient[WouldExportResponse]
+
 // GoBgpServiceServer is the server API for GoBgpService service.
 // All implementations must embed UnimplementedGoBgpServiceServer
 // for forward compatibility.
@@ -977,6 +1001,10 @@ type GoBgpServiceServer interface {
 	// Bendrr fork (D-066): explicit-trigger reload of the mounted D-014
 	// location-metric map.
 	ReloadLocationMetric(context.Context, *ReloadLocationMetricRequest) (*ReloadLocationMetricResponse, error)
+	// Bendrr fork (D-031): shadow-mode would-export evaluator — what the named
+	// staged export policy would send to one peer if it were the assigned
+	// export policy, without transmitting anything.
+	WouldExport(*WouldExportRequest, grpc.ServerStreamingServer[WouldExportResponse]) error
 	mustEmbedUnimplementedGoBgpServiceServer()
 }
 
@@ -1166,6 +1194,9 @@ func (UnimplementedGoBgpServiceServer) ListTcpAoKeychain(*ListTcpAoKeychainReque
 }
 func (UnimplementedGoBgpServiceServer) ReloadLocationMetric(context.Context, *ReloadLocationMetricRequest) (*ReloadLocationMetricResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReloadLocationMetric not implemented")
+}
+func (UnimplementedGoBgpServiceServer) WouldExport(*WouldExportRequest, grpc.ServerStreamingServer[WouldExportResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method WouldExport not implemented")
 }
 func (UnimplementedGoBgpServiceServer) mustEmbedUnimplementedGoBgpServiceServer() {}
 func (UnimplementedGoBgpServiceServer) testEmbeddedByValue()                      {}
@@ -2159,6 +2190,17 @@ func _GoBgpService_ReloadLocationMetric_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GoBgpService_WouldExport_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WouldExportRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GoBgpServiceServer).WouldExport(m, &grpc.GenericServerStream[WouldExportRequest, WouldExportResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GoBgpService_WouldExportServer = grpc.ServerStreamingServer[WouldExportResponse]
+
 // GoBgpService_ServiceDesc is the grpc.ServiceDesc for GoBgpService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2421,6 +2463,11 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ListTcpAoKeychain",
 			Handler:       _GoBgpService_ListTcpAoKeychain_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "WouldExport",
+			Handler:       _GoBgpService_WouldExport_Handler,
 			ServerStreams: true,
 		},
 	},
