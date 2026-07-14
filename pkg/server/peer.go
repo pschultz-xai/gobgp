@@ -143,6 +143,13 @@ type peer struct {
 	// lazily allocated and nil in practice. Neither map retains zero-valued
 	// entries.
 	advOverflow map[table.PathLocalKey]advOverflowState
+	// sentPathsCount counts the sent bits currently set across advRoutes and
+	// advOverflow per family, maintained by setSentLocked and cleared by
+	// resetAdvertisedRoutes (both under advMu). It lets the advertised-route
+	// count be served in O(1) (ListPeer with EnableAdvertised, e.g. the
+	// Prometheus collector) instead of recomputing the peer's export set
+	// from the Loc-RIB inside the mgmt loop (Bendrr U2).
+	sentPathsCount map[bgp.Family]int64
 	llgrEndChs  []chan struct{} // protected by fsm.lock
 	longLivedRunning    atomic.Bool
 	// Route Target Membership handler after import policy (for constrained VPN distribution).
@@ -350,22 +357,62 @@ func (peer *peer) resetAdvertisedRoutes() {
 	defer peer.advMu.Unlock()
 	peer.advRoutes = make(map[table.PathDestLocalKey]advertisedState)
 	peer.advOverflow = nil
+	peer.sentPathsCount = nil
 }
 
-// setSentLocked sets or clears the advertised bit for key. Caller must hold
-// advMu.
+// getSentPathsCount returns the number of paths currently advertised to the
+// peer for family, served from the bookkeeping maintained on the update path
+// so it never walks the RIB (Bendrr U2).
+func (peer *peer) getSentPathsCount(family bgp.Family) uint64 {
+	peer.advMu.Lock()
+	defer peer.advMu.Unlock()
+	if n := peer.sentPathsCount[family]; n > 0 {
+		return uint64(n)
+	}
+	return 0
+}
+
+// addSentPathsCountLocked adjusts the per-family count of set sent bits.
+// Caller must hold advMu.
+func (peer *peer) addSentPathsCountLocked(family bgp.Family, delta int64) {
+	if peer.sentPathsCount == nil {
+		peer.sentPathsCount = make(map[bgp.Family]int64)
+	}
+	peer.sentPathsCount[family] += delta
+	if peer.sentPathsCount[family] == 0 {
+		delete(peer.sentPathsCount, family)
+	}
+}
+
+// setSentLocked sets or clears the advertised bit for key, keeping the
+// per-family sent-path count in sync. Caller must hold advMu.
 func (peer *peer) setSentLocked(key table.PathLocalKey, on bool) {
 	if key.Id >= advInlineIDs {
 		st := peer.advOverflow[key]
+		if st.sent != on {
+			if on {
+				peer.addSentPathsCountLocked(key.Family, 1)
+			} else {
+				peer.addSentPathsCountLocked(key.Family, -1)
+			}
+		}
 		st.sent = on
 		peer.storeOverflowLocked(key, st)
 		return
 	}
 	st := peer.advRoutes[key.PathDestLocalKey]
+	was := st.sent&(1<<key.Id) != 0
 	if on {
 		st.sent |= 1 << key.Id
 	} else {
 		st.sent &^= 1 << key.Id
+	}
+	if was != on {
+		if on {
+			peer.addSentPathsCountLocked(key.Family, 1)
+		} else {
+			peer.addSentPathsCountLocked(key.Family, -1)
+		}
 	}
 	peer.storeAdvLocked(key.PathDestLocalKey, st)
 }
