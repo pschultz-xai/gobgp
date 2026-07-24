@@ -131,6 +131,24 @@ func TestAddPathsEmptyBatchIsRequestError(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestBatchAboveCapIsRequestError pins the maxBatchPaths guard: a batch
+// over the cap is rejected wholesale (nothing applied) — an unbounded
+// batch would be an unbounded management-loop stall.
+func TestBatchAboveCapIsRequestError(t *testing.T) {
+	s := runNewServer(t, 65001, "1.1.1.1", -1)
+	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	over := make([]*apiutil.Path, maxBatchPaths+1)
+	for i := range over {
+		over[i] = mustApi2apiutilPath(batchTestPath(t, byte(i%250), uint32(i)+1))
+	}
+	_, err := s.AddPaths(apiutil.AddPathRequest{Paths: over})
+	assert.Error(t, err)
+	assert.Equal(t, 0, globalRIBPathCount(t, s), "an over-cap batch must install nothing")
+	_, err = s.DeletePaths(apiutil.DeletePathsRequest{Paths: over})
+	assert.Error(t, err)
+}
+
 // TestDeletePathsBatchRemovesByKey pins the keyed batch withdraw: one
 // DeletePaths call removes exactly the requested (prefix, identifier)
 // items and leaves the rest.
