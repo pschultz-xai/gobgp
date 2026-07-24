@@ -114,6 +114,14 @@ service GoBgpService {
   // staged export policy would send to one peer if it were the assigned
   // export policy, without transmitting anything.
   rpc WouldExport(WouldExportRequest) returns (stream WouldExportResponse);
+
+  // Bendrr fork (R-005): batched unary apply verbs — N paths per RPC, one
+  // management-loop dispatch per batch. Unlike AddPathStream, the unary
+  // shape keeps per-RPC deadline semantics, and the response carries
+  // index-aligned per-item results so a client retries exactly the items
+  // that failed.
+  rpc AddPaths(AddPathsRequest) returns (AddPathsResponse);
+  rpc DeletePaths(DeletePathsRequest) returns (DeletePathsResponse);
 }
 
 message StartBgpRequest {
@@ -1506,4 +1514,43 @@ message WouldExportRequest {
 
 message WouldExportResponse {
   Destination destination = 1;
+}
+
+// Bendrr fork (R-005): batched unary apply verbs. Partial failure is
+// explicit and per-item: the RPC itself errors only on request-level
+// problems (empty batch, unknown vrf_id, unsupported table type); an
+// individual path that fails to convert or install is reported at its
+// index and does not disturb the other items.
+message AddPathsRequest {
+  TableType table_type = 1;
+  string vrf_id = 2;
+  repeated Path paths = 3;
+}
+
+// PathOpResult is one item's outcome, index-aligned with the request's
+// paths.
+message PathOpResult {
+  // Empty on success; the failure reason otherwise.
+  string error = 1;
+  // AddPaths only: uuid of the installed path. Rotates on every re-add of
+  // the same (prefix, identifier) — callers must store the latest.
+  bytes uuid = 2;
+}
+
+message AddPathsResponse {
+  repeated PathOpResult results = 1;
+}
+
+// DeletePathsRequest carries keyed deletes only — each path is resolved by
+// NLRI + identifier (contract rule 4's production verb). The uuid and
+// delete-all forms deliberately stay on DeletePath: a batch must never be
+// able to widen into a table clear.
+message DeletePathsRequest {
+  TableType table_type = 1;
+  string vrf_id = 2;
+  repeated Path paths = 3;
+}
+
+message DeletePathsResponse {
+  repeated PathOpResult results = 1;
 }
