@@ -2657,6 +2657,104 @@ func (s *BgpServer) DeletePath(req apiutil.DeletePathRequest) error {
 	}, true)
 }
 
+// AddPaths installs a batch of paths with ONE management-loop dispatch and
+// per-item results (Bendrr R-005). An item that fails to convert or install
+// is reported at its index and does not disturb the other items — the
+// caller owns retry granularity. The returned error is request-level only
+// (empty batch, unknown VRF, server stopped); when it is nil the results
+// slice is index-aligned with req.Paths.
+func (s *BgpServer) AddPaths(req apiutil.AddPathRequest) ([]apiutil.AddPathResponse, error) {
+	if len(req.Paths) == 0 {
+		return nil, fmt.Errorf("no path(s) to add")
+	}
+	isVRF := false
+	if req.VRFID != "" {
+		if _, ok := s.globalRib.GetVrf(req.VRFID); !ok {
+			return nil, fmt.Errorf("vrf %s not found", req.VRFID)
+		}
+		isVRF = true
+	}
+
+	resps := make([]apiutil.AddPathResponse, len(req.Paths))
+	err := s.mgmtOperation(func() error {
+		for i, p := range req.Paths {
+			if p == nil {
+				resps[i].Error = errors.New("path is nil")
+				continue
+			}
+			path, err := apiutil2Path(p, isVRF)
+			if err != nil {
+				resps[i].Error = err
+				continue
+			}
+			if err := s.addPathList(req.VRFID, []*table.Path{path}); err != nil {
+				resps[i].Error = err
+				continue
+			}
+			id, err := uuid.NewRandom()
+			if err != nil {
+				resps[i].Error = err
+				continue
+			}
+			s.uuidMap[pathTokey(path)] = id
+			resps[i].UUID = id
+		}
+		return nil
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	return resps, nil
+}
+
+// DeletePaths withdraws a batch of paths by key (NLRI + identifier) with
+// ONE management-loop dispatch and per-item results (Bendrr R-005). Keyed
+// deletes only — the uuid and delete-all forms stay on DeletePath. Same
+// error contract as AddPaths: a nil error means results is index-aligned
+// with req.Paths.
+func (s *BgpServer) DeletePaths(req apiutil.DeletePathsRequest) ([]apiutil.DeletePathResponse, error) {
+	if len(req.Paths) == 0 {
+		return nil, errors.New("no path(s) to delete")
+	}
+	isVRF := false
+	if req.VRFID != "" {
+		if _, ok := s.globalRib.GetVrf(req.VRFID); !ok {
+			return nil, fmt.Errorf("vrf %s not found", req.VRFID)
+		}
+		isVRF = true
+	}
+
+	resps := make([]apiutil.DeletePathResponse, len(req.Paths))
+	err := s.mgmtOperation(func() error {
+		deletePathList := make([]*table.Path, 0, len(req.Paths))
+		for i, p := range req.Paths {
+			if p == nil {
+				resps[i].Error = errors.New("path is nil")
+				continue
+			}
+			path, err := apiutil2Path(p, isVRF, true)
+			if err != nil {
+				resps[i].Error = err
+				continue
+			}
+			if err := s.fixupApiPath(req.VRFID, []*table.Path{path}); err != nil {
+				resps[i].Error = err
+				continue
+			}
+			delete(s.uuidMap, pathTokey(path))
+			deletePathList = append(deletePathList, path)
+		}
+		if len(deletePathList) > 0 {
+			s.propagateUpdate(nil, deletePathList)
+		}
+		return nil
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	return resps, nil
+}
+
 func (s *BgpServer) updatePath(vrfId string, pathList []*table.Path) error {
 	err := s.mgmtOperation(func() error {
 		if err := s.fixupApiPath(vrfId, pathList); err != nil {

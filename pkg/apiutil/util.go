@@ -72,6 +72,19 @@ type DeletePathRequest struct {
 	Paths        []*Path
 }
 
+// DeletePathsRequest is used by server.DeletePaths API (Bendrr R-005):
+// keyed per-path deletes only — the uuid and delete-all forms stay on
+// DeletePathRequest so a batch can never widen into a table clear.
+type DeletePathsRequest struct {
+	VRFID string
+	Paths []*Path
+}
+
+// DeletePathResponse is one per-item server.DeletePaths result.
+type DeletePathResponse struct {
+	Error error
+}
+
 type LookupOption uint8
 
 const (
