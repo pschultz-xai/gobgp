@@ -101,6 +101,8 @@ const (
 	GoBgpService_ListTcpAoKeychain_FullMethodName      = "/api.GoBgpService/ListTcpAoKeychain"
 	GoBgpService_ReloadLocationMetric_FullMethodName   = "/api.GoBgpService/ReloadLocationMetric"
 	GoBgpService_WouldExport_FullMethodName            = "/api.GoBgpService/WouldExport"
+	GoBgpService_AddPaths_FullMethodName               = "/api.GoBgpService/AddPaths"
+	GoBgpService_DeletePaths_FullMethodName            = "/api.GoBgpService/DeletePaths"
 )
 
 // GoBgpServiceClient is the client API for GoBgpService service.
@@ -175,6 +177,13 @@ type GoBgpServiceClient interface {
 	// staged export policy would send to one peer if it were the assigned
 	// export policy, without transmitting anything.
 	WouldExport(ctx context.Context, in *WouldExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WouldExportResponse], error)
+	// Bendrr fork (R-005): batched unary apply verbs — N paths per RPC, one
+	// management-loop dispatch per batch. Unlike AddPathStream, the unary
+	// shape keeps per-RPC deadline semantics, and the response carries
+	// index-aligned per-item results so a client retries exactly the items
+	// that failed.
+	AddPaths(ctx context.Context, in *AddPathsRequest, opts ...grpc.CallOption) (*AddPathsResponse, error)
+	DeletePaths(ctx context.Context, in *DeletePathsRequest, opts ...grpc.CallOption) (*DeletePathsResponse, error)
 }
 
 type goBgpServiceClient struct {
@@ -933,6 +942,26 @@ func (c *goBgpServiceClient) WouldExport(ctx context.Context, in *WouldExportReq
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type GoBgpService_WouldExportClient = grpc.ServerStreamingClient[WouldExportResponse]
 
+func (c *goBgpServiceClient) AddPaths(ctx context.Context, in *AddPathsRequest, opts ...grpc.CallOption) (*AddPathsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AddPathsResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_AddPaths_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) DeletePaths(ctx context.Context, in *DeletePathsRequest, opts ...grpc.CallOption) (*DeletePathsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeletePathsResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_DeletePaths_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GoBgpServiceServer is the server API for GoBgpService service.
 // All implementations must embed UnimplementedGoBgpServiceServer
 // for forward compatibility.
@@ -1005,6 +1034,13 @@ type GoBgpServiceServer interface {
 	// staged export policy would send to one peer if it were the assigned
 	// export policy, without transmitting anything.
 	WouldExport(*WouldExportRequest, grpc.ServerStreamingServer[WouldExportResponse]) error
+	// Bendrr fork (R-005): batched unary apply verbs — N paths per RPC, one
+	// management-loop dispatch per batch. Unlike AddPathStream, the unary
+	// shape keeps per-RPC deadline semantics, and the response carries
+	// index-aligned per-item results so a client retries exactly the items
+	// that failed.
+	AddPaths(context.Context, *AddPathsRequest) (*AddPathsResponse, error)
+	DeletePaths(context.Context, *DeletePathsRequest) (*DeletePathsResponse, error)
 	mustEmbedUnimplementedGoBgpServiceServer()
 }
 
@@ -1197,6 +1233,12 @@ func (UnimplementedGoBgpServiceServer) ReloadLocationMetric(context.Context, *Re
 }
 func (UnimplementedGoBgpServiceServer) WouldExport(*WouldExportRequest, grpc.ServerStreamingServer[WouldExportResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method WouldExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) AddPaths(context.Context, *AddPathsRequest) (*AddPathsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddPaths not implemented")
+}
+func (UnimplementedGoBgpServiceServer) DeletePaths(context.Context, *DeletePathsRequest) (*DeletePathsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeletePaths not implemented")
 }
 func (UnimplementedGoBgpServiceServer) mustEmbedUnimplementedGoBgpServiceServer() {}
 func (UnimplementedGoBgpServiceServer) testEmbeddedByValue()                      {}
@@ -2201,6 +2243,42 @@ func _GoBgpService_WouldExport_Handler(srv interface{}, stream grpc.ServerStream
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type GoBgpService_WouldExportServer = grpc.ServerStreamingServer[WouldExportResponse]
 
+func _GoBgpService_AddPaths_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddPathsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).AddPaths(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_AddPaths_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).AddPaths(ctx, req.(*AddPathsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_DeletePaths_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeletePathsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).DeletePaths(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_DeletePaths_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).DeletePaths(ctx, req.(*DeletePathsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GoBgpService_ServiceDesc is the grpc.ServiceDesc for GoBgpService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2387,6 +2465,14 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReloadLocationMetric",
 			Handler:    _GoBgpService_ReloadLocationMetric_Handler,
+		},
+		{
+			MethodName: "AddPaths",
+			Handler:    _GoBgpService_AddPaths_Handler,
+		},
+		{
+			MethodName: "DeletePaths",
+			Handler:    _GoBgpService_DeletePaths_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
