@@ -691,6 +691,96 @@ func (s *server) DeletePath(ctx context.Context, r *api.DeletePathRequest) (*api
 	return &api.DeletePathResponse{}, deletePath(ctx, r)
 }
 
+// convertBatchPaths maps each request path to apiutil form, recording
+// conversion failures as per-item results (Bendrr R-005 — a malformed item
+// must not fail its batch siblings). Returns the converted paths and their
+// request indices.
+func convertBatchPaths(paths []*api.Path, results []*api.PathOpResult) (conv []*apiutil.Path, idx []int) {
+	conv = make([]*apiutil.Path, 0, len(paths))
+	idx = make([]int, 0, len(paths))
+	for i, p := range paths {
+		if p == nil {
+			results[i] = &api.PathOpResult{Error: "path is nil"}
+			continue
+		}
+		if p.Family == nil {
+			results[i] = &api.PathOpResult{Error: "family is not set"}
+			continue
+		}
+		ap, err := api2apiutilPath(p)
+		if err != nil {
+			results[i] = &api.PathOpResult{Error: fmt.Sprintf("invalid path: %v", err)}
+			continue
+		}
+		conv = append(conv, ap)
+		idx = append(idx, i)
+	}
+	return conv, idx
+}
+
+func (s *server) AddPaths(ctx context.Context, r *api.AddPathsRequest) (*api.AddPathsResponse, error) {
+	if r.TableType != api.TableType_TABLE_TYPE_GLOBAL && r.TableType != api.TableType_TABLE_TYPE_VRF {
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported table type: %s", r.TableType)
+	}
+	if len(r.Paths) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "no path(s) to add")
+	}
+	results := make([]*api.PathOpResult, len(r.Paths))
+	conv, idx := convertBatchPaths(r.Paths, results)
+	if len(conv) > 0 {
+		resps, err := s.bgpServer.AddPaths(apiutil.AddPathRequest{VRFID: r.VrfId, Paths: conv})
+		if err != nil {
+			return nil, err
+		}
+		for j, resp := range resps {
+			if resp.Error != nil {
+				results[idx[j]] = &api.PathOpResult{Error: resp.Error.Error()}
+				continue
+			}
+			uuidBytes, err := resp.UUID.MarshalBinary()
+			if err != nil {
+				results[idx[j]] = &api.PathOpResult{Error: err.Error()}
+				continue
+			}
+			results[idx[j]] = &api.PathOpResult{Uuid: uuidBytes}
+		}
+	}
+	for i, res := range results {
+		if res == nil {
+			results[i] = &api.PathOpResult{}
+		}
+	}
+	return &api.AddPathsResponse{Results: results}, nil
+}
+
+func (s *server) DeletePaths(ctx context.Context, r *api.DeletePathsRequest) (*api.DeletePathsResponse, error) {
+	if r.TableType != api.TableType_TABLE_TYPE_GLOBAL && r.TableType != api.TableType_TABLE_TYPE_VRF {
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported table type: %s", r.TableType)
+	}
+	if len(r.Paths) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "no path(s) to delete")
+	}
+	results := make([]*api.PathOpResult, len(r.Paths))
+	conv, idx := convertBatchPaths(r.Paths, results)
+	if len(conv) > 0 {
+		resps, err := s.bgpServer.DeletePaths(apiutil.DeletePathsRequest{VRFID: r.VrfId, Paths: conv})
+		if err != nil {
+			return nil, err
+		}
+		for j, resp := range resps {
+			if resp.Error != nil {
+				results[idx[j]] = &api.PathOpResult{Error: resp.Error.Error()}
+			}
+		}
+	}
+	for i, res := range results {
+		if res == nil {
+			results[i] = &api.PathOpResult{}
+		}
+	}
+	return &api.DeletePathsResponse{Results: results}, nil
+}
+
 func (s *server) EnableMrt(ctx context.Context, r *api.EnableMrtRequest) (*api.EnableMrtResponse, error) {
 	return &api.EnableMrtResponse{}, s.bgpServer.EnableMrt(ctx, r)
 }
