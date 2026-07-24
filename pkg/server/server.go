@@ -2543,6 +2543,8 @@ func apiutil2Path(path *apiutil.Path, isVRFTable bool, isWithdraw ...bool) (*tab
 	return p, nil
 }
 
+// NOTE: the batched AddPaths below (Bendrr R-005) mirrors this body —
+// change them together on rebase.
 func (s *BgpServer) AddPath(req apiutil.AddPathRequest) ([]apiutil.AddPathResponse, error) {
 	if len(req.Paths) == 0 {
 		return []apiutil.AddPathResponse{}, fmt.Errorf("no path(s) to add")
@@ -2657,15 +2659,28 @@ func (s *BgpServer) DeletePath(req apiutil.DeletePathRequest) error {
 	}, true)
 }
 
+// maxBatchPaths bounds one AddPaths / DeletePaths request. The batch holds
+// the management loop for its whole length, so an unbounded batch is an
+// unbounded stall for every other operation queued behind it; above the cap
+// the request is rejected wholesale (request-level error, mirroring the
+// empty-batch check) rather than partially applied.
+const maxBatchPaths = 4096
+
 // AddPaths installs a batch of paths with ONE management-loop dispatch and
 // per-item results (Bendrr R-005). An item that fails to convert or install
 // is reported at its index and does not disturb the other items — the
 // caller owns retry granularity. The returned error is request-level only
-// (empty batch, unknown VRF, server stopped); when it is nil the results
-// slice is index-aligned with req.Paths.
+// (empty batch, oversized batch, unknown VRF, server stopped); when it is
+// nil the results slice is index-aligned with req.Paths.
+//
+// Kept in lockstep with the unary AddPath above — a rebase that changes
+// AddPath's validation or install semantics must change this body too.
 func (s *BgpServer) AddPaths(req apiutil.AddPathRequest) ([]apiutil.AddPathResponse, error) {
 	if len(req.Paths) == 0 {
 		return nil, fmt.Errorf("no path(s) to add")
+	}
+	if len(req.Paths) > maxBatchPaths {
+		return nil, fmt.Errorf("batch of %d paths exceeds the %d cap", len(req.Paths), maxBatchPaths)
 	}
 	isVRF := false
 	if req.VRFID != "" {
@@ -2712,9 +2727,15 @@ func (s *BgpServer) AddPaths(req apiutil.AddPathRequest) ([]apiutil.AddPathRespo
 // deletes only — the uuid and delete-all forms stay on DeletePath. Same
 // error contract as AddPaths: a nil error means results is index-aligned
 // with req.Paths.
+//
+// Kept in lockstep with the keyed branch of the unary DeletePath — a rebase
+// that changes its delete semantics must change this body too.
 func (s *BgpServer) DeletePaths(req apiutil.DeletePathsRequest) ([]apiutil.DeletePathResponse, error) {
 	if len(req.Paths) == 0 {
 		return nil, errors.New("no path(s) to delete")
+	}
+	if len(req.Paths) > maxBatchPaths {
+		return nil, fmt.Errorf("batch of %d paths exceeds the %d cap", len(req.Paths), maxBatchPaths)
 	}
 	isVRF := false
 	if req.VRFID != "" {

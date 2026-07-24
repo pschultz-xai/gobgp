@@ -644,6 +644,8 @@ func api2apiutilPath(path *api.Path) (*apiutil.Path, error) {
 	return p, nil
 }
 
+// NOTE: the batched AddPaths handler below (Bendrr R-005) mirrors this
+// handler's validation — change them together on rebase.
 func (s *server) AddPath(ctx context.Context, r *api.AddPathRequest) (*api.AddPathResponse, error) {
 	if r.Path == nil {
 		return nil, status.Error(codes.InvalidArgument, "path is required")
@@ -731,12 +733,17 @@ func convertBatchPaths(paths []*api.Path, results []*api.PathOpResult) (conv []*
 	return conv, idx
 }
 
+// Batched sibling of the unary AddPath handler above (Bendrr R-005) —
+// keep validation and uuid semantics in sync on rebase.
 func (s *server) AddPaths(ctx context.Context, r *api.AddPathsRequest) (*api.AddPathsResponse, error) {
 	if r.TableType != api.TableType_TABLE_TYPE_GLOBAL && r.TableType != api.TableType_TABLE_TYPE_VRF {
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported table type: %s", r.TableType)
 	}
 	if len(r.Paths) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no path(s) to add")
+	}
+	if len(r.Paths) > maxBatchPaths {
+		return nil, status.Errorf(codes.InvalidArgument, "batch of %d paths exceeds the %d cap", len(r.Paths), maxBatchPaths)
 	}
 	results := make([]*api.PathOpResult, len(r.Paths))
 	conv, idx := convertBatchPaths(r.Paths, results)
@@ -766,12 +773,17 @@ func (s *server) AddPaths(ctx context.Context, r *api.AddPathsRequest) (*api.Add
 	return &api.AddPathsResponse{Results: results}, nil
 }
 
+// Batched sibling of the unary DeletePath handler's keyed branch (Bendrr
+// R-005) — keep validation in sync on rebase.
 func (s *server) DeletePaths(ctx context.Context, r *api.DeletePathsRequest) (*api.DeletePathsResponse, error) {
 	if r.TableType != api.TableType_TABLE_TYPE_GLOBAL && r.TableType != api.TableType_TABLE_TYPE_VRF {
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported table type: %s", r.TableType)
 	}
 	if len(r.Paths) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no path(s) to delete")
+	}
+	if len(r.Paths) > maxBatchPaths {
+		return nil, status.Errorf(codes.InvalidArgument, "batch of %d paths exceeds the %d cap", len(r.Paths), maxBatchPaths)
 	}
 	results := make([]*api.PathOpResult, len(r.Paths))
 	conv, idx := convertBatchPaths(r.Paths, results)
