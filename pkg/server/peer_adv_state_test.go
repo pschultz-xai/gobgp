@@ -253,6 +253,7 @@ func TestListPeerAdvertisedCount(t *testing.T) {
 		require.NoError(t, err)
 		cleanInfiniteChannel(target.fsm.outgoingCh)
 		require.NoError(t, s.StopBgp(context.Background(), &api.StopBgpRequest{}))
+		s.bfdServer.Stop()
 	})
 
 	const pathCount = 16

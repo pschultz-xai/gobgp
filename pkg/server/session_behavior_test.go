@@ -161,7 +161,7 @@ func TestGracefulRestartHoldsThenFlushes(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { pod.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(pod.Stop)
 
 	// Pod neighbor A (::1): iBGP announcer with GR helper role.
 	err = pod.AddPeer(context.Background(), &api.AddPeerRequest{Peer: &api.Peer{
@@ -209,7 +209,7 @@ func TestGracefulRestartHoldsThenFlushes(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { routerA.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(routerA.Stop)
 
 	establishedA := newPeerStateWaiter(routerA, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = routerA.AddPeer(context.Background(), &api.AddPeerRequest{Peer: &api.Peer{
@@ -244,7 +244,7 @@ func TestGracefulRestartHoldsThenFlushes(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { routerB.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(routerB.Stop)
 
 	establishedB := newPeerStateWaiter(routerB, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = routerB.AddPeer(context.Background(), &api.AddPeerRequest{Peer: &api.Peer{
