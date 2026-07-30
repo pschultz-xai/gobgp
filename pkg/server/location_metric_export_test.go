@@ -74,7 +74,7 @@ func startLocationMetricPair(t *testing.T, sendMax uint8, podOpts ...ServerOptio
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { pod.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(pod.Stop)
 
 	router = NewBgpServer()
 	go router.Serve()
@@ -86,7 +86,7 @@ func startLocationMetricPair(t *testing.T, sendMax uint8, podOpts ...ServerOptio
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { router.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(router.Stop)
 
 	// Pod side: passive iBGP neighbor with ADD-PATH send capped at sendMax
 	// (the peer-group SendMax compiled from edge_export.add_path_max).
@@ -264,7 +264,7 @@ func TestLocationMetricSendMaxExportsTopRankedInitialDump(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { pod.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(pod.Stop)
 
 	// Loc-RIB is populated before any session exists.
 	injectLocationCandidate(t, pod, 30, 1)
@@ -304,7 +304,7 @@ func TestLocationMetricSendMaxExportsTopRankedInitialDump(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { router.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(router.Stop)
 
 	routerNeighbor := &oc.Neighbor{
 		Config: oc.NeighborConfig{

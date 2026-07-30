@@ -78,7 +78,7 @@ func globalRIBPathCount(t *testing.T, s *BgpServer) int {
 // installs every item and returns a uuid per index.
 func TestAddPathsBatchInstallsAll(t *testing.T) {
 	s := runNewServer(t, 65001, "1.1.1.1", -1)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	paths := make([]*apiutil.Path, 0, 4)
 	for i := byte(0); i < 4; i++ {
@@ -99,7 +99,7 @@ func TestAddPathsBatchInstallsAll(t *testing.T) {
 // call itself does not error.
 func TestAddPathsPartialFailureIsPerItem(t *testing.T) {
 	s := runNewServer(t, 65001, "1.1.1.1", -1)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	bad := mustApi2apiutilPath(batchTestPath(t, 1, 2))
 	bad.Family = 0 // apiutil2Path rejects an unset family
@@ -123,7 +123,7 @@ func TestAddPathsPartialFailureIsPerItem(t *testing.T) {
 // request-level error, not an empty success.
 func TestAddPathsEmptyBatchIsRequestError(t *testing.T) {
 	s := runNewServer(t, 65001, "1.1.1.1", -1)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	_, err := s.AddPaths(apiutil.AddPathRequest{})
 	assert.Error(t, err)
@@ -136,7 +136,7 @@ func TestAddPathsEmptyBatchIsRequestError(t *testing.T) {
 // batch would be an unbounded management-loop stall.
 func TestBatchAboveCapIsRequestError(t *testing.T) {
 	s := runNewServer(t, 65001, "1.1.1.1", -1)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	over := make([]*apiutil.Path, maxBatchPaths+1)
 	for i := range over {
@@ -154,7 +154,7 @@ func TestBatchAboveCapIsRequestError(t *testing.T) {
 // items and leaves the rest.
 func TestDeletePathsBatchRemovesByKey(t *testing.T) {
 	s := runNewServer(t, 65001, "1.1.1.1", -1)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	paths := make([]*apiutil.Path, 0, 4)
 	for i := byte(0); i < 4; i++ {
@@ -180,7 +180,7 @@ func TestDeletePathsBatchRemovesByKey(t *testing.T) {
 // still withdraw in the same dispatch.
 func TestDeletePathsPartialFailureIsPerItem(t *testing.T) {
 	s := runNewServer(t, 65001, "1.1.1.1", -1)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	_, err := s.AddPaths(apiutil.AddPathRequest{Paths: []*apiutil.Path{
 		mustApi2apiutilPath(batchTestPath(t, 0, 1)),
@@ -220,7 +220,7 @@ func TestGRPCBatchApplyVerbs(t *testing.T) {
 		Global: &api.Global{Asn: 65001, RouterId: "1.1.1.1", ListenPort: -1},
 	})
 	require.NoError(t, err)
-	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+	defer s.Stop()
 
 	conn, err := grpc.NewClient(socketAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
