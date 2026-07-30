@@ -77,7 +77,7 @@ func startMixedRibTopology(t *testing.T, sendMax uint8) (pod, routerA, routerB *
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { pod.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(pod.Stop)
 
 	// Router A attachment: plain iBGP over ::1, the source of the
 	// iBGP-learned local path.
@@ -139,7 +139,7 @@ func startMixedRibTopology(t *testing.T, sendMax uint8) (pod, routerA, routerB *
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { routerA.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(routerA.Stop)
 
 	routerANeighbor := &oc.Neighbor{
 		Config: oc.NeighborConfig{
@@ -179,7 +179,7 @@ func startMixedRibTopology(t *testing.T, sendMax uint8) (pod, routerA, routerB *
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { routerB.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(routerB.Stop)
 
 	routerBNeighbor := &oc.Neighbor{
 		Config: oc.NeighborConfig{
