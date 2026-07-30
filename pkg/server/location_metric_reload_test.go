@@ -56,7 +56,7 @@ func startPlainLocationMetricPair(t *testing.T) (pod *BgpServer, router *BgpServ
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { pod.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(pod.Stop)
 
 	router = NewBgpServer()
 	go router.Serve()
@@ -68,7 +68,7 @@ func startPlainLocationMetricPair(t *testing.T) (pod *BgpServer, router *BgpServ
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { router.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	t.Cleanup(router.Stop)
 
 	podNeighbor := &oc.Neighbor{
 		Config: oc.NeighborConfig{
