@@ -1836,10 +1836,17 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateRe
 			switch m := o.(type) {
 			case *fsmOutgoingMsg:
 				const maxCoalesceMsgs = 2048 // safety cap
+				// Bendrr (R-212 leg 2): bound the PATHS marshaled per round,
+				// not just the coalesced message count. Marshaling an
+				// unbounded batch in one go kept the loop away from the
+				// keepalive ticker for minutes during bulk loads, letting
+				// the peer's hold timer expire while UPDATEs were still
+				// being serialized.
+				const maxPathsPerSendRound = 8192
 				paths := m.Paths
 				coalescedMsgs := 1
 				// coalesce queued messages for more efficient UPDATE packing
-				for coalescedMsgs < maxCoalesceMsgs {
+				for coalescedMsgs < maxCoalesceMsgs && len(paths) < maxPathsPerSendRound {
 					select {
 					case <-ctx.Done():
 						return nil
@@ -1867,9 +1874,28 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateRe
 					AddPath:         fsm.familyMap.Load().(map[bgp.Family]bgp.BGPAddPathMode),
 					ExtendedMessage: fsm.extendedMessage.Load(),
 				}
-				for _, msg := range table.CreateUpdateMsgFromPaths(paths, options) {
-					if err := send(msg); err != nil {
+				// Marshal and send in bounded rounds, servicing the
+				// keepalive ticker between rounds so an oversized batch
+				// (from any producer) can never starve keepalives. Path
+				// order is preserved across rounds, so later duplicates of
+				// an NLRI still land later on the wire.
+				for len(paths) > 0 {
+					n := min(len(paths), maxPathsPerSendRound)
+					round := paths[:n]
+					paths = paths[n:]
+					for _, msg := range table.CreateUpdateMsgFromPaths(round, options) {
+						if err := send(msg); err != nil {
+							return nil
+						}
+					}
+					select {
+					case <-ctx.Done():
 						return nil
+					case <-ticker.C:
+						if err := send(bgp.NewBGPKeepAliveMessage()); err != nil {
+							return nil
+						}
+					default:
 					}
 				}
 			default:
