@@ -211,6 +211,7 @@ func (s *BgpServer) propagateReRankedDestinations(dsts []*table.Update, stats *L
 				return
 			}
 			targetPeer.updateRoutes(paths...)
+			targetPeer.markExportDumpDirty(paths)
 			sendfsmOutgoingMsg(targetPeer, paths)
 			for _, p := range paths {
 				if p.IsWithdraw {
