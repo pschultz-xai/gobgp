@@ -49,10 +49,13 @@ package server
 //     sent-state was empty, so ranked ADD-PATH sync re-announces the full
 //     top-SendMax set and plain-peer deltas are idempotent replaces;
 //   - the flush enqueues a stale copy before live marks: the live update is
-//     enqueued after it in FIFO order, and CreateUpdateMsgFromPaths keeps
-//     only the last action per *wire* key within a coalesced batch (the
-//     local path ID is ignored for families without ADD-PATH send, where
-//     it is not serialized), so the fresh state wins on the wire;
+//     enqueued after it in FIFO order. The send loop slices the coalesced
+//     queue into bounded marshal rounds that preserve that order, and
+//     within one round CreateUpdateMsgFromPaths keeps only the last action
+//     per *wire* key (the local path ID is ignored for families without
+//     ADD-PATH send, where it is not serialized) — so across rounds the
+//     later round lands later on the wire, and within a round the later
+//     action is the only survivor: the fresh state wins either way;
 //   - a live delta that produces NO output for a plain peer implies the
 //     best path did not change, so the snapshot copy is still correct and
 //     must not be skipped — which is exactly why marking happens at
@@ -78,10 +81,11 @@ package server
 // protocol-legal, merely redundant; losing one is not).
 //
 // The dirty set is bounded by the number of distinct destinations that
-// live-churn touches while a dump is in flight — worst case the RIB's
-// destination count, transiently, and it is dropped when the walk finishes
-// or aborts. At Bendrr churn rates this is noise next to the snapshot the
-// walk itself holds.
+// live-churn touches while a dump is in flight, and it is dropped when the
+// walk finishes or aborts. The theoretical worst case (every destination
+// churned mid-dump) is the same order of heap as the snapshot the walk
+// holds; at Bendrr churn rates the realistic footprint is a small fraction
+// of that, for the dump's duration only.
 
 import (
 	"log/slog"
@@ -127,9 +131,10 @@ type exportDumpState struct {
 	// paths' dest-local keys, which match on both sides including the VRF
 	// ToLocal translation.
 	dirty map[table.PathDestLocalKey]struct{}
-	// inflight is the family set the current walk still owes the peer; a
-	// superseding dump unions it into its own request, merging the option
-	// flags below so the aborted dump's semantics are not lost.
+	// inflight is the current walk's full requested family set (not
+	// narrowed as families complete — a supersede conservatively re-dumps
+	// them all); a superseding dump unions it into its own request, merging
+	// the option flags below so the aborted dump's semantics are not lost.
 	inflight []bgp.Family
 	// inflightWithdrawFiltered / inflightDropWithdraws mirror the in-flight
 	// dump's exportDumpOpts flags (meaningful only while inflight is
@@ -148,13 +153,6 @@ type exportDumpOpts struct {
 	// dropWithdraws replays GR deferral-expiry semantics: withdraw paths
 	// (e.g. LLGR-stale clones) are stripped from the dump.
 	dropWithdraws bool
-	// waitEstablished makes the walk wait for the FSM loop to store the
-	// ESTABLISHED state before snapshotting. Establish-transition sites set
-	// this because handleFSMMessage runs before fsm.state.Store: snapshotting
-	// after the store closes the window where an update is too late for the
-	// snapshot but too early for live propagation (needToAdvertise still
-	// false).
-	waitEstablished bool
 }
 
 // markExportDumpDirty records the destinations of live-propagated output
@@ -188,6 +186,8 @@ func (peer *peer) abortExportDump() {
 	d.gen++
 	d.dirty = nil
 	d.inflight = nil
+	d.inflightWithdrawFiltered = false
+	d.inflightDropWithdraws = false
 }
 
 func (peer *peer) exportDumpAborted(gen uint64) bool {
@@ -346,6 +346,13 @@ func (s *BgpServer) snapshotExportDump(peer *peer, families []bgp.Family) []*exp
 // per-path SendMax flag mutations are recorded here and applied at flush
 // time so that dirty destinations (owned by live propagation) keep the flags
 // the live path computed from fresh state.
+//
+// Known benign staleness: a snapshot path that was withdrawn mid-dump
+// without producing live output (it was send-max-suppressed, so the
+// withdraw was skipped and the destination not marked dirty) can still get
+// its filtered flag set here, and destination localIDs are reused. A later
+// path inheriting the ID may briefly read as suppressed until the next
+// update or ranked sync for that destination rewrites the flags.
 type exportDumpChunkEntry struct {
 	key              table.PathDestLocalKey
 	paths            []*table.Path // withdraws (refresh mode) then announcements
@@ -449,6 +456,8 @@ func (peer *peer) finishExportDump(gen uint64) {
 	}
 	d.dirty = nil
 	d.inflight = nil
+	d.inflightWithdrawFiltered = false
+	d.inflightDropWithdraws = false
 }
 
 // runExportDump is the per-peer dump goroutine.
@@ -456,16 +465,28 @@ func (s *BgpServer) runExportDump(peer *peer, o exportDumpOpts, gen uint64) {
 	logger := peer.fsm.logger
 	start := time.Now()
 
-	if o.waitEstablished {
-		// handleFSMMessage runs before fsm.state.Store(ESTABLISHED);
-		// snapshotting after the store means every update is either in the
-		// snapshot or live-propagated (needToAdvertise true) — no gap.
-		for peer.State() != bgp.BGP_FSM_ESTABLISHED {
-			if peer.exportDumpAborted(gen) {
-				return
-			}
-			time.Sleep(exportDumpEstablishPoll)
+	// Never snapshot before the FSM loop stores the ESTABLISHED state:
+	// handleFSMMessage's establish callback runs before fsm.state.Store, and
+	// until the store lands live propagation skips the peer (needToAdvertise
+	// false), so a pre-store snapshot would silently lose every update in
+	// that window. Checking the live state here (instead of a per-site
+	// opt-in flag) also covers a dump that supersedes an establish dump
+	// mid-window — e.g. another peer's GR sync-finished loop hitting this
+	// peer during its establish callback. Non-establish sites only run for
+	// established peers, so this is a no-op for them; a peer that never
+	// establishes is unwound by the PeerDown/stopFSM generation bump.
+	for peer.State() != bgp.BGP_FSM_ESTABLISHED {
+		if peer.exportDumpAborted(gen) {
+			return
 		}
+		time.Sleep(exportDumpEstablishPoll)
+	}
+	// Re-check after the wait: a session flap can satisfy the state check
+	// with the *new* session while this walk's generation is already stale —
+	// nothing wrong would reach the wire (every flush re-checks), but the
+	// snapshot burst is worth skipping.
+	if peer.exportDumpAborted(gen) {
+		return
 	}
 
 	snap := s.snapshotExportDump(peer, o.families)

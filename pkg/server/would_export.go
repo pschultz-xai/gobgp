@@ -127,21 +127,13 @@ func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn fu
 			sendMax = int(p.getAddPathSendMax(r.Family))
 		}
 
-		// The ROA table is mutated on the serve-loop goroutine (same one
-		// that runs mgmt operations), so it must not be read during the
-		// off-loop evaluation phase. When RPKI is enabled, precompute the
-		// validations here — the validateTable pattern; when it is not
-		// (the common case), policy RPKI conditions never match, exactly
-		// as with a nil Validate.
-		if s.roaManager.enabled() {
-			v := make(map[*table.Path]*table.Validation)
-			for _, dst := range dests {
-				for _, path := range dst.candidates {
-					v[path] = s.roaTable.Validate(path)
-				}
-			}
-			validate = func(p *table.Path) *table.Validation { return v[p] }
-		}
+		// The ROA table carries its own lock (Bendrr R-212), so Validate
+		// is safe to call during the off-loop evaluation phase — and using
+		// it unconditionally keeps this shadow evaluation identical to the
+		// real export path, which always passes roaTable.Validate (an
+		// RPKI condition matching NOT_FOUND behaves differently under a
+		// nil Validate).
+		validate = s.roaTable.Validate
 		return nil
 	}, true)
 	if err != nil {

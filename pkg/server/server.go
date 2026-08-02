@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"slices"
@@ -1095,6 +1096,13 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 // already-advertised paths that stay inside the SendMax cut cost nothing.
 func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey) []*table.Path {
 	sendMax := int(peer.getAddPathSendMax(family))
+	// SendMax == 0 means "no cap" everywhere else (the initial-dump slot
+	// logic, evalExportDumpDest); ADD-PATH send is only negotiated with
+	// SendMax > 0 today, but if that ever changes this must not read as
+	// "withdraw everything".
+	if sendMax <= 0 {
+		sendMax = math.MaxInt
+	}
 
 	result := []*table.Path{}
 	slots := 0
@@ -1580,12 +1588,21 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						for _, d := range dsts {
 							toDelete := d.GetWithdrawnPath()
 							toActuallyDelete := make([]*table.Path, 0, len(toDelete))
-							for _, p := range toDelete {
+							// Bendrr (R-212): the destination lookup must use a
+							// global-space path: for VRF-attached peers
+							// filterpath applies ToLocal, whose family/prefix
+							// keys the wrong table and would make the backfill
+							// below a silent no-op.
+							var lookupPath *table.Path
+							for _, withdrawn := range toDelete {
 								// if the path is filtered, there is no need to send the withdrawal
-								p := s.filterpath(targetPeer, p, nil)
+								p := s.filterpath(targetPeer, withdrawn, nil)
 								// the path was never advertized to the peer
 								if p == nil || targetPeer.unsetPathSendMaxFiltered(p) {
 									continue
+								}
+								if lookupPath == nil {
+									lookupPath = withdrawn
 								}
 								toActuallyDelete = append(toActuallyDelete, p)
 							}
@@ -1594,7 +1611,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								continue
 							}
 
-							destination := rib.GetDestination(toActuallyDelete[0])
+							destination := rib.GetDestination(lookupPath)
 							l = append(l, toActuallyDelete...)
 
 							// the destination has been removed from the table
@@ -1935,12 +1952,11 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 					// here, synchronously on the FSM callback before the
 					// send/recv loops exist — at scale that is minutes of
 					// wire silence and the peer's hold timer always wins.
-					// Hand it to the async chunked walk; waitEstablished
-					// makes the walk snapshot after fsm.state.Store so live
-					// propagation covers everything newer than the snapshot.
+					// Hand it to the async chunked walk, which snapshots only
+					// after fsm.state.Store so live propagation covers
+					// everything newer than the snapshot.
 					s.startExportDump(peer, exportDumpOpts{
-						families:        peer.negotiatedRFList(),
-						waitEstablished: true,
+						families: peer.negotiatedRFList(),
 					})
 				}
 			} else {
@@ -1981,12 +1997,12 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 						if !p.isGracefulRestartEnabled() && !peerLocalRestarting {
 							continue
 						}
-						// Bendrr (R-212): async chunked dump. Only the peer
-						// transitioning inside this callback needs to wait
-						// for its ESTABLISHED store.
+						// Bendrr (R-212): async chunked dump. The walk itself
+						// waits for each peer's ESTABLISHED store, which
+						// matters for the peer transitioning inside this
+						// callback (its store has not run yet).
 						s.startExportDump(p, exportDumpOpts{
-							families:        p.configuredRFlist(),
-							waitEstablished: p == peer,
+							families: p.configuredRFlist(),
 						})
 					}
 					peer.fsm.logger.Info("sync finished")

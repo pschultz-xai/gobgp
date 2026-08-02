@@ -478,6 +478,7 @@ func TestExportDumpLiveUpdatesDuringDumpConverge(t *testing.T) {
 
 	// Drain everything: dump chunks, EOR, and live deltas (which may trail
 	// the EOR). Stop once the queue stays silent.
+	var queued []*table.Path
 	lastCommunity := make(map[string]uint32, numDests)
 	deadline := time.After(30 * time.Second)
 	for {
@@ -490,6 +491,7 @@ func TestExportDumpLiveUpdatesDuringDumpConverge(t *testing.T) {
 					continue
 				}
 				require.False(t, path.IsWithdraw)
+				queued = append(queued, path)
 				comms := path.GetCommunities()
 				require.Len(t, comms, 1)
 				lastCommunity[path.GetPrefix()] = comms[0]
@@ -508,6 +510,47 @@ func TestExportDumpLiveUpdatesDuringDumpConverge(t *testing.T) {
 			assert.Equal(t, uint32(999), comm, "changed destination %s must end at the fresh value", prefix)
 		} else {
 			assert.Equal(t, uint32(100), comm, "unchanged destination %s must keep the original value", prefix)
+		}
+	}
+
+	// End-to-end: replay the drained queue through the send loop's actual
+	// round slicing and CreateUpdateMsgFromPaths, and assert the final
+	// on-wire state per NLRI. This is where a stale dump copy could beat a
+	// fresh live copy (the packers emit announcement groups in map order);
+	// the wire-key dedupe within a round plus FIFO order across rounds must
+	// make the fresh value land last regardless.
+	const roundSize = 8192 // maxPathsPerSendRound in fsm.go sendMessageloop
+	wire := make(map[string]uint32, numDests)
+	for len(queued) > 0 {
+		n := min(len(queued), roundSize)
+		round := queued[:n]
+		queued = queued[n:]
+		for _, msg := range table.CreateUpdateMsgFromPaths(round) {
+			u := msg.Body.(*bgp.BGPUpdate)
+			require.Empty(t, u.WithdrawnRoutes)
+			var comm uint32
+			hasComm := false
+			for _, attr := range u.PathAttributes {
+				if c, ok := attr.(*bgp.PathAttributeCommunities); ok {
+					require.Len(t, c.Value, 1)
+					comm = c.Value[0]
+					hasComm = true
+				}
+			}
+			if len(u.NLRI) > 0 {
+				require.True(t, hasComm)
+			}
+			for _, nlri := range u.NLRI {
+				wire[nlri.NLRI.String()] = comm
+			}
+		}
+	}
+	require.Len(t, wire, numDests, "every destination must reach the wire")
+	for prefix, comm := range wire {
+		if _, ok := changed[prefix]; ok {
+			assert.Equal(t, uint32(999), comm, "changed destination %s must end at the fresh value on the wire", prefix)
+		} else {
+			assert.Equal(t, uint32(100), comm, "unchanged destination %s must keep the original value on the wire", prefix)
 		}
 	}
 }
