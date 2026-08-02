@@ -50,8 +50,9 @@ package server
 //     top-SendMax set and plain-peer deltas are idempotent replaces;
 //   - the flush enqueues a stale copy before live marks: the live update is
 //     enqueued after it in FIFO order, and CreateUpdateMsgFromPaths keeps
-//     only the last action per path key within a coalesced batch, so the
-//     fresh state wins on the wire;
+//     only the last action per *wire* key within a coalesced batch (the
+//     local path ID is ignored for families without ADD-PATH send, where
+//     it is not serialized), so the fresh state wins on the wire;
 //   - a live delta that produces NO output for a plain peer implies the
 //     best path did not change, so the snapshot copy is still correct and
 //     must not be skipped — which is exactly why marking happens at
@@ -71,7 +72,16 @@ package server
 //
 // A superseding dump (e.g. a ROUTE-REFRESH received while the establish dump
 // is still running) unions the unfinished families of the dump it aborts so
-// coverage is never lost.
+// coverage is never lost, and merges its option flags conservatively:
+// withdraw-filtered semantics win over the GR-deferral withdraw-stripping
+// optimization when the two mix (sending a withdraw during deferral is
+// protocol-legal, merely redundant; losing one is not).
+//
+// The dirty set is bounded by the number of distinct destinations that
+// live-churn touches while a dump is in flight — worst case the RIB's
+// destination count, transiently, and it is dropped when the walk finishes
+// or aborts. At Bendrr churn rates this is noise next to the snapshot the
+// walk itself holds.
 
 import (
 	"log/slog"
@@ -118,8 +128,14 @@ type exportDumpState struct {
 	// ToLocal translation.
 	dirty map[table.PathDestLocalKey]struct{}
 	// inflight is the family set the current walk still owes the peer; a
-	// superseding dump unions it into its own request.
+	// superseding dump unions it into its own request, merging the option
+	// flags below so the aborted dump's semantics are not lost.
 	inflight []bgp.Family
+	// inflightWithdrawFiltered / inflightDropWithdraws mirror the in-flight
+	// dump's exportDumpOpts flags (meaningful only while inflight is
+	// non-empty).
+	inflightWithdrawFiltered bool
+	inflightDropWithdraws    bool
 }
 
 // exportDumpOpts selects the per-site behavior of a dump. All converted
@@ -234,32 +250,21 @@ func (s *BgpServer) startExportDump(peer *peer, o exportDumpOpts) {
 	d.gen++
 	gen := d.gen
 	d.dirty = make(map[table.PathDestLocalKey]struct{})
-	o.families = unionFamilies(o.families, d.inflight)
+	if len(d.inflight) > 0 {
+		// Superseding an unfinished dump: take over its family debt and
+		// merge its semantics. Withdraw coverage must never be lost, so
+		// withdrawFiltered is sticky; the deferral-only withdraw-stripping
+		// optimization survives only when both dumps asked for it.
+		o.families = unionFamilies(o.families, d.inflight)
+		o.withdrawFiltered = o.withdrawFiltered || d.inflightWithdrawFiltered
+		o.dropWithdraws = o.dropWithdraws && d.inflightDropWithdraws
+	}
 	d.inflight = o.families
+	d.inflightWithdrawFiltered = o.withdrawFiltered
+	d.inflightDropWithdraws = o.dropWithdraws
 	d.mu.Unlock()
 
-	// The ROA table is only safe to read while holding s.shared.mu (it is
-	// mutated under mgmt operations), so when RPKI is enabled the snapshot
-	// and validation precompute happen here, on the calling goroutine — the
-	// F9 validateTable pattern, accepting the synchronous cost. Bendrr runs
-	// with RPKI disabled, where policy RPKI conditions never match, exactly
-	// as with a nil Validate (same equivalence F9 relies on).
-	var pre []*exportDumpFamily
-	var validate func(*table.Path) *table.Validation
-	if s.roaManager.enabled() {
-		pre = s.snapshotExportDump(peer, o.families)
-		v := make(map[*table.Path]*table.Validation)
-		for _, fam := range pre {
-			for _, dd := range fam.dests {
-				for _, p := range dd.candidates {
-					v[p] = s.roaTable.Validate(p)
-				}
-			}
-		}
-		validate = func(p *table.Path) *table.Validation { return v[p] }
-	}
-
-	go s.runExportDump(peer, o, gen, pre, validate)
+	go s.runExportDump(peer, o, gen)
 }
 
 // applyLegacyDumpOpts reproduces the pre-R-212 softResetOut callback
@@ -351,13 +356,13 @@ type exportDumpChunkEntry struct {
 // evalExportDumpDest runs one snapshot destination through the export
 // pipeline. It performs no peer state mutation — everything is recorded in
 // the returned entry. ok is false when the destination contributes nothing.
-func (s *BgpServer) evalExportDumpDest(peer *peer, fam *exportDumpFamily, dd exportDumpDest, o exportDumpOpts, validate func(*table.Path) *table.Validation) (exportDumpChunkEntry, bool) {
+func (s *BgpServer) evalExportDumpDest(peer *peer, fam *exportDumpFamily, dd exportDumpDest, o exportDumpOpts) (exportDumpChunkEntry, bool) {
 	var e exportDumpChunkEntry
 	haveKey := false
 	slots := 0
 	var announce []*table.Path
 	for _, path := range dd.candidates {
-		fp := s.filterpathValidate(peer, path, nil, validate)
+		fp := s.filterpath(peer, path, nil)
 		if fp == nil {
 			if o.withdrawFiltered {
 				w := filteredPathForPeer(peer, path)
@@ -446,9 +451,8 @@ func (peer *peer) finishExportDump(gen uint64) {
 	d.inflight = nil
 }
 
-// runExportDump is the per-peer dump goroutine. pre is non-nil only when the
-// caller had to snapshot synchronously for the ROA precompute.
-func (s *BgpServer) runExportDump(peer *peer, o exportDumpOpts, gen uint64, pre []*exportDumpFamily, validate func(*table.Path) *table.Validation) {
+// runExportDump is the per-peer dump goroutine.
+func (s *BgpServer) runExportDump(peer *peer, o exportDumpOpts, gen uint64) {
 	logger := peer.fsm.logger
 	start := time.Now()
 
@@ -464,10 +468,7 @@ func (s *BgpServer) runExportDump(peer *peer, o exportDumpOpts, gen uint64, pre 
 		}
 	}
 
-	snap := pre
-	if snap == nil {
-		snap = s.snapshotExportDump(peer, o.families)
-	}
+	snap := s.snapshotExportDump(peer, o.families)
 
 	totalDests := 0
 	for _, fam := range snap {
@@ -523,7 +524,7 @@ func (s *BgpServer) runExportDump(peer *peer, o exportDumpOpts, gen uint64, pre 
 					return
 				}
 			}
-			entry, ok := s.evalExportDumpDest(peer, fam, dd, o, validate)
+			entry, ok := s.evalExportDumpDest(peer, fam, dd, o)
 			if !ok {
 				continue
 			}

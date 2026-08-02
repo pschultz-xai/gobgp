@@ -604,6 +604,12 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 			// We send a path even if it is not the best path. See comments in
 			// (*Destination) GetChanges().
 			dst := peer.localRib.GetDestination(path)
+			// Bendrr (R-212): the async export dump walk evaluates snapshot
+			// paths off the serve loop, so the destination may have been
+			// withdrawn from the live RIB since the snapshot was taken.
+			if dst == nil {
+				return nil, nil, true
+			}
 			path = nil
 			for _, p := range dst.GetKnownPathList(peer.TableID(), peer.AS()) {
 				srcPeer := p.GetSource()
@@ -702,21 +708,16 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 	return path
 }
 
+// filterpath computes the peer's export view of path. It is safe to call
+// off the serve loop (Bendrr R-212 export dump walk): the ROA table carries
+// its own lock, prePolicyFilterpath reads shard-locked table snapshots, and
+// policy application is read-only against the peer's assignment.
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
-	return s.filterpathValidate(peer, path, old, s.roaTable.Validate)
-}
-
-// filterpathValidate is filterpath with an injectable RPKI validation
-// function, for callers that run off the serve loop where s.roaTable must
-// not be read (Bendrr R-212 export dump walk; same pattern as F9's
-// WouldExport). validate may be nil, which matches upstream semantics when
-// RPKI is not enabled.
-func (s *BgpServer) filterpathValidate(peer *peer, path, old *table.Path, validate func(*table.Path) *table.Validation) *table.Path {
 	path, options, stop := s.prePolicyFilterpath(peer, path, old)
 	if stop {
 		return nil
 	}
-	options.Validate = validate
+	options.Validate = s.roaTable.Validate
 	path = peer.policy.ApplyPolicy(peer.TableID(), table.POLICY_DIRECTION_EXPORT, path, options)
 	// When 'path' is filtered (path == nil), check 'old' has been sent to this peer.
 	// If it has, send withdrawal to the peer.
@@ -1602,23 +1603,19 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								continue
 							}
 
+							// Bendrr (R-212): re-derive the ranked export set
+							// instead of promoting only send-max-flagged paths.
+							// While an initial export dump is in flight the
+							// bookkeeping for un-dumped destinations is empty
+							// (no flags set), so the flag-based backfill would
+							// promote nothing — and since this delta marks the
+							// destination dirty (making the dump walk skip
+							// it), the surviving paths would never be
+							// announced at all. The ranked sync computes the
+							// set from the known-path list itself and is a
+							// no-op for already-converged destinations.
 							knownPathList := destination.GetKnownPathList(targetPeer.TableID(), targetPeer.AS())
-							toAdd := make([]*table.Path, 0, len(knownPathList))
-							for _, p := range knownPathList {
-								// If the path is filtered by policies, there is no need to send the path
-								// Otherwise, we send only paths that were previously filtered because of the max path limit
-								p := s.filterpath(targetPeer, p, nil)
-								if p == nil || !targetPeer.isPathSendMaxFiltered(p) {
-									continue
-								}
-								// We unset the flag as the path is not filtered anymore
-								targetPeer.unsetPathSendMaxFiltered(p)
-								toAdd = append(toAdd, p)
-								if len(toAdd) == len(toActuallyDelete) {
-									break
-								}
-							}
-							l = append(l, toAdd...)
+							l = append(l, s.syncRankedAddPathSetFromList(targetPeer, f, knownPathList, nil)...)
 						}
 						targetPeer.updateRoutes(l...)
 						return l

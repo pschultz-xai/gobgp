@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"sort"
+	"sync"
 
 	"github.com/k-sone/critbitgo"
 	"github.com/osrg/gobgp/v4/pkg/config/oc"
@@ -68,7 +69,16 @@ func (r *roaBucket) GetEntries() []*ROA {
 	return r.entries
 }
 
+// ROATable maps prefixes to their ROA entries for RPKI origin validation.
+//
+// Bendrr (R-212): the table carries its own lock instead of relying on the
+// callers' BgpServer management lock. The async export dump walk validates
+// paths off the serve loop without holding shared.mu, so it would otherwise
+// race RPKI updates (Add/Delete/DeleteAll run under mgmt ops). Mutations are
+// rare (RPKI cache refreshes) and reads take an uncontended RLock, so the
+// hot propagate path is unaffected.
 type ROATable struct {
+	mu     sync.RWMutex
 	trees  map[bgp.Family]*critbitgo.Net
 	logger *slog.Logger
 }
@@ -114,6 +124,8 @@ func (rt *ROATable) getBucket(roa *ROA) *roaBucket {
 }
 
 func (rt *ROATable) Add(roa *ROA) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	b := rt.getBucket(roa)
 	for _, r := range b.entries {
 		if r.Equal(roa) {
@@ -140,6 +152,8 @@ func (rt *ROATable) Add(roa *ROA) {
 }
 
 func (rt *ROATable) Delete(roa *ROA) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	tree := rt.roa2tree(roa)
 	if b, ok, _ := tree.Get(roa.Network); ok {
 		bucket := b.(*roaBucket)
@@ -159,6 +173,8 @@ func (rt *ROATable) Delete(roa *ROA) {
 }
 
 func (rt *ROATable) DeleteAll(network string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	for _, tree := range rt.trees {
 		deleteNetworks := make([]*net.IPNet, 0, tree.Size())
 		tree.Walk(nil, func(n *net.IPNet, v any) bool {
@@ -192,6 +208,8 @@ func (rt *ROATable) Validate(path *Path) *Validation {
 		// RPKI isn't enabled or invalid path
 		return nil
 	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
 	tree, ok := rt.trees[path.GetFamily()]
 	if !ok {
 		return nil
@@ -265,6 +283,8 @@ func (rt *ROATable) Validate(path *Path) *Validation {
 }
 
 func (rt *ROATable) Info(family bgp.Family) (map[string]uint32, map[string]uint32) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
 	records := make(map[string]uint32)
 	prefixes := make(map[string]uint32)
 
@@ -289,6 +309,8 @@ func (rt *ROATable) Info(family bgp.Family) (map[string]uint32, map[string]uint3
 }
 
 func (rt *ROATable) List(family bgp.Family) ([]*ROA, error) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
 	var rfList []bgp.Family
 	switch family {
 	case bgp.RF_IPv4_UC:

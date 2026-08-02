@@ -314,6 +314,133 @@ func TestExportDumpAbortOnPeerDown(t *testing.T) {
 	}
 }
 
+// TestExportDumpAddPathWithdrawBackfillDuringDump: a withdraw that lands on
+// an ADD-PATH SendMax peer while a dump is in flight — before the dump has
+// flushed the destination — must announce the surviving ranked set alongside
+// the withdraw. The pre-fix flag-based backfill promoted only paths flagged
+// send-max-filtered, which is nothing mid-dump; since the delta also marks
+// the destination dirty (the dump then skips it), the surviving paths would
+// never have reached the peer at all.
+func TestExportDumpAddPathWithdrawBackfillDuringDump(t *testing.T) {
+	s := newExportDumpTestServer(t)
+	t.Cleanup(func() {
+		require.NoError(t, s.StopBgp(context.Background(), &api.StopBgpRequest{}))
+		s.bfdServer.Stop()
+	})
+
+	peerAddr := netip.MustParseAddr("10.0.0.1")
+	p := newPeerandInfo(t, 65001, 65002, peerAddr.String(), s.globalRib)
+	p.policy = s.policy
+	p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{
+		bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND,
+	})
+	p.fsm.lock.Lock()
+	conf := p.fsm.pConf.ReadCopy()
+	foundFamily := false
+	for i := range conf.AfiSafis {
+		if conf.AfiSafis[i].State.Family != bgp.RF_IPv4_UC {
+			continue
+		}
+		conf.AfiSafis[i].AddPaths.Config.SendMax = 1
+		conf.AfiSafis[i].AddPaths.State.SendMax = 1
+		foundFamily = true
+	}
+	p.fsm.pConf.Update(&conf)
+	p.fsm.lock.Unlock()
+	require.True(t, foundFamily)
+	err := s.mgmtOperation(func() error {
+		s.neighborMap[peerAddr] = p
+		return nil
+	}, true)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := s.mgmtOperation(func() error {
+			delete(s.neighborMap, peerAddr)
+			return nil
+		}, false)
+		require.NoError(t, err)
+		p.abortExportDump()
+		cleanInfiniteChannel(p.fsm.outgoingCh)
+	})
+
+	makeSourcePath := func(source string, isWithdraw bool) *table.Path {
+		t.Helper()
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.0/32"))
+		require.NoError(t, err)
+		nextHop, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.254"))
+		require.NoError(t, err)
+		sourceAddr := netip.MustParseAddr(source)
+		return table.NewPath(bgp.RF_IPv4_UC, &table.PeerInfo{
+			AS:           65010,
+			ID:           sourceAddr,
+			Address:      sourceAddr,
+			LocalAS:      65001,
+			LocalID:      netip.MustParseAddr("1.1.1.1"),
+			LocalAddress: netip.MustParseAddr("1.1.1.1"),
+		}, bgp.PathNLRI{NLRI: nlri}, isWithdraw, []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{65010}),
+			}),
+			nextHop,
+		}, time.Now(), false)
+	}
+
+	// Seed two paths for the destination while the peer is NOT yet
+	// advertising: no live delta runs, no bookkeeping exists — the state a
+	// destination is in before the dump walk reaches it.
+	pathA := makeSourcePath("10.0.0.2", false)
+	pathB := makeSourcePath("10.0.0.3", false)
+	s.propagateUpdate(nil, []*table.Path{pathA, pathB})
+
+	// A dump is in flight (installed directly for determinism, mirroring
+	// startExportDump), and the peer is now advertising.
+	d := &p.dump
+	d.mu.Lock()
+	d.gen++
+	gen := d.gen
+	d.dirty = make(map[table.PathDestLocalKey]struct{})
+	d.inflight = []bgp.Family{bgp.RF_IPv4_UC}
+	d.mu.Unlock()
+	p.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED)
+
+	// Withdraw one of the two paths before the dump flushes the destination.
+	s.propagateUpdate(nil, []*table.Path{makeSourcePath("10.0.0.2", true)})
+
+	var got []*table.Path
+	select {
+	case o := <-p.fsm.outgoingCh.Out():
+		msg, ok := o.(*fsmOutgoingMsg)
+		require.True(t, ok)
+		got = msg.Paths
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the withdraw delta")
+	}
+
+	var withdraws, announces []*table.Path
+	for _, path := range got {
+		require.False(t, path.IsEOR())
+		if path.IsWithdraw {
+			withdraws = append(withdraws, path)
+		} else {
+			announces = append(announces, path)
+		}
+	}
+	require.Len(t, withdraws, 1)
+	assert.Equal(t, pathA.LocalID(), withdraws[0].LocalID())
+	require.Len(t, announces, 1, "the surviving ranked path must be announced with the withdraw")
+	assert.Equal(t, pathB.LocalID(), announces[0].LocalID())
+	assert.True(t, p.hasPathAlreadyBeenSent(announces[0]), "the announced survivor must be booked as sent")
+
+	// The delta claimed the destination: a late dump flush for it must be
+	// skipped, not overwrite the fresh state.
+	staleEntry := exportDumpChunkEntry{key: pathA.GetDestLocalKey(), paths: []*table.Path{pathA}}
+	sent, skipped, ok := s.flushExportDumpChunk(p, gen, []exportDumpChunkEntry{staleEntry}, nil)
+	require.True(t, ok)
+	assert.Zero(t, sent)
+	assert.Equal(t, 1, skipped)
+}
+
 // TestExportDumpLiveUpdatesDuringDumpConverge races live propagation against
 // a running establish dump: whatever the interleaving (dirty-skip before the
 // dump reaches the destination, or fresh update enqueued after a stale
@@ -368,7 +495,7 @@ func TestExportDumpLiveUpdatesDuringDumpConverge(t *testing.T) {
 				lastCommunity[path.GetPrefix()] = comms[0]
 			}
 			continue
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(2 * time.Second):
 		case <-deadline:
 			t.Fatal("queue never went silent")
 		}
@@ -439,6 +566,7 @@ func TestSendMessageloopKeepaliveDuringBulkUpdates(t *testing.T) {
 	wg.Wait()
 
 	msgs := parseBGPUpdates(t, m.GetSentMessages())
+	assert.Equal(t, numPaths, countNLRIs(msgs), "every path exactly once: no drops, no duplicates across marshal rounds")
 	firstUpdate, lastUpdate := -1, -1
 	keepalives := make([]int, 0, 8)
 	for i, msg := range msgs {

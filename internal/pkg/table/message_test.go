@@ -672,6 +672,79 @@ func TestMergeMPReachNLRIs(t *testing.T) {
 	assert.Equal(t, nr, total)
 }
 
+// TestCreateUpdateMsgWireKeyDedupe (Bendrr R-212): within one packing pass,
+// only the last action per *wire* identity may survive. Without ADD-PATH
+// send the local path ID is not serialized, so two paths for the same prefix
+// are one route on the wire — if both survived, the packers' map-ordered
+// emission would let a stale copy land after the fresh one nondeterministically.
+func TestCreateUpdateMsgWireKeyDedupe(t *testing.T) {
+	makeV4Path := func(localID uint32, community uint32) *Path {
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"))
+		assert.NoError(t, err)
+		nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+		assert.NoError(t, err)
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{65001}),
+			}),
+			nh,
+			bgp.NewPathAttributeCommunities([]uint32{community}),
+		}
+		p := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+		p.localID = localID
+		return p
+	}
+
+	stale := makeV4Path(1, 100)
+	fresh := makeV4Path(2, 999)
+
+	collect := func(msgs []*bgp.BGPMessage) (nlris []bgp.PathNLRI, communities []uint32) {
+		for _, msg := range msgs {
+			u := msg.Body.(*bgp.BGPUpdate)
+			nlris = append(nlris, u.NLRI...)
+			if len(u.NLRI) == 0 {
+				continue
+			}
+			for _, attr := range u.PathAttributes {
+				if c, ok := attr.(*bgp.PathAttributeCommunities); ok {
+					communities = append(communities, c.Value...)
+				}
+			}
+		}
+		return nlris, communities
+	}
+
+	// No ADD-PATH: one wire route; only the later (fresh) copy may survive.
+	nlris, communities := collect(CreateUpdateMsgFromPaths([]*Path{stale, fresh}))
+	assert.Len(t, nlris, 1, "same prefix without ADD-PATH is one wire route")
+	assert.Equal(t, []uint32{999}, communities, "the later action must win")
+
+	// Announce-then-withdraw for the same prefix: the withdraw is the final
+	// state and the announcement must be dropped.
+	msgs := CreateUpdateMsgFromPaths([]*Path{fresh, stale.Clone(true)})
+	announced, withdrawn := 0, 0
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		announced += len(u.NLRI)
+		withdrawn += len(u.WithdrawnRoutes)
+	}
+	assert.Zero(t, announced)
+	assert.Equal(t, 1, withdrawn)
+
+	// With ADD-PATH send negotiated the path ID is on the wire: both paths
+	// are distinct routes and must both survive.
+	options := &bgp.MarshallingOption{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{
+			bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND,
+		},
+	}
+	nlris, _ = collect(CreateUpdateMsgFromPaths([]*Path{stale, fresh}, options))
+	assert.Len(t, nlris, 2, "distinct path IDs with ADD-PATH send are distinct wire routes")
+	ids := []uint32{nlris[0].ID, nlris[1].ID}
+	assert.ElementsMatch(t, []uint32{1, 2}, ids)
+}
+
 func TestMergeMPUnreachNLRIs(t *testing.T) {
 	nr := 512
 	paths := make([]*Path, 0, nr)
