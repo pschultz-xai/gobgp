@@ -156,6 +156,9 @@ type peer struct {
 	rtmHandler *table.RouteTargetMembershipHandler
 	// Route refresh in progress, during an established session or route refresh, this need to be atomic to avoid out of order updates
 	routeRefreshInProgress sync.RWMutex
+	// Asynchronous full-RIB export dump coordination (Bendrr R-212); see
+	// export_dump.go.
+	dump exportDumpState
 }
 
 func newPeer(g *oc.Global, conf *oc.Neighbor, state bgp.FSMState, loc *table.TableManager, policy *table.RoutingPolicy, logger *slog.Logger) *peer {
@@ -895,6 +898,11 @@ func (peer *peer) startFSM(wg *sync.WaitGroup, callback fsmCallback) {
 }
 
 func (peer *peer) stopFSM() {
+	// Invalidate any in-flight export dump walk before the FSM loop can
+	// exit and close outgoingCh; abortExportDump serializes behind an
+	// in-flight chunk flush, so no enqueue can happen after the close
+	// (Bendrr R-212).
+	peer.abortExportDump()
 	peer.fsm.stop()
 }
 

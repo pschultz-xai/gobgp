@@ -695,14 +695,26 @@ func CreateUpdateMsgFromPaths(pathList []*Path, options ...*bgp.MarshallingOptio
 	msgs := make([]*bgp.BGPMessage, 0, len(pathList))
 
 	// Since sendMessageloop coalesces outgoing BGP UPDATE messages and
-	// the packers emit withdrawals before announcements, we should keep only the
-	// last action for each NLRI/path-id within one packing pass.
-	last := make(map[PathLocalKey]*Path, len(pathList))
-	for _, path := range pathList {
+	// the packers emit announcement groups in (nondeterministic) map order,
+	// we must keep only the last action for each *wire* identity within one
+	// packing pass: when ADD-PATH send is not negotiated for the family the
+	// local path ID is not serialized, so two paths for the same prefix are
+	// the same route on the wire and only the later one may survive.
+	// Otherwise the receiver's final state would depend on map iteration
+	// order, breaking the FIFO convergence the async export dump relies on.
+	wireKey := func(path *Path) PathLocalKey {
+		key := path.GetLocalKey()
+		if !bgp.IsAddPathEnabled(false, path.GetFamily(), options) {
+			key.Id = 0
+		}
+		return key
+	}
+	last := make(map[PathLocalKey]int, len(pathList))
+	for i, path := range pathList {
 		if path == nil || path.IsEOR() {
 			continue
 		}
-		last[path.GetLocalKey()] = path
+		last[wireKey(path)] = i
 	}
 
 	m := make(map[bgp.Family]packerInterface)
@@ -714,7 +726,7 @@ func CreateUpdateMsgFromPaths(pathList []*Path, options ...*bgp.MarshallingOptio
 		m[f].add(path)
 	}
 
-	for _, path := range pathList {
+	for i, path := range pathList {
 		if path == nil {
 			continue
 		}
@@ -722,7 +734,7 @@ func CreateUpdateMsgFromPaths(pathList []*Path, options ...*bgp.MarshallingOptio
 			add(path)
 			continue
 		}
-		if last[path.GetLocalKey()] != path {
+		if last[wireKey(path)] != i {
 			continue
 		}
 		add(path)
