@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"slices"
@@ -606,6 +607,12 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 			// We send a path even if it is not the best path. See comments in
 			// (*Destination) GetChanges().
 			dst := peer.localRib.GetDestination(path)
+			// Bendrr (R-212): the async export dump walk evaluates snapshot
+			// paths off the serve loop, so the destination may have been
+			// withdrawn from the live RIB since the snapshot was taken.
+			if dst == nil {
+				return nil, nil, true
+			}
 			path = nil
 			for _, p := range dst.GetKnownPathList(peer.TableID(), peer.AS()) {
 				srcPeer := p.GetSource()
@@ -704,6 +711,10 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 	return path
 }
 
+// filterpath computes the peer's export view of path. It is safe to call
+// off the serve loop (Bendrr R-212 export dump walk): the ROA table carries
+// its own lock, prePolicyFilterpath reads shard-locked table snapshots, and
+// policy application is read-only against the peer's assignment.
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
 	path, options, stop := s.prePolicyFilterpath(peer, path, old)
 	if stop {
@@ -1089,6 +1100,13 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 // already-advertised paths that stay inside the SendMax cut cost nothing.
 func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey) []*table.Path {
 	sendMax := int(peer.getAddPathSendMax(family))
+	// SendMax == 0 means "no cap" everywhere else (the initial-dump slot
+	// logic, evalExportDumpDest); ADD-PATH send is only negotiated with
+	// SendMax > 0 today, but if that ever changes this must not read as
+	// "withdraw everything".
+	if sendMax <= 0 {
+		sendMax = math.MaxInt
+	}
 
 	result := []*table.Path{}
 	slots := 0
@@ -1313,13 +1331,11 @@ func (s *BgpServer) handleRouteRefresh(peer *peer, e *fsmMsg) {
 		peer.fsm.logger.Warn("ROUTE_REFRESH received but the capability wasn't advertised")
 		return
 	}
-	rfList := []bgp.Family{rf}
-	s.getBestFromLocalCallback(peer, rfList, true, true, func(paths []*table.Path, filtered []*table.Path) {
-		if len(paths) > 0 {
-			peer.updateRoutes(paths...)
-			sendfsmOutgoingMsg(peer, paths)
-		}
-	})
+	// Bendrr (R-212): a peer-initiated ROUTE-REFRESH regenerates the full
+	// export set, which used to run synchronously on the FSM callback under
+	// the route-refresh write lock — the same starvation wedge as the
+	// establish dump. Run it through the async chunked walk instead.
+	s.startExportDump(peer, exportDumpOpts{families: []bgp.Family{rf}})
 }
 
 // dropAdjRIBIn removes the peer's Adj-RIB-In for the given families and
@@ -1455,6 +1471,7 @@ func (s *BgpServer) processRTCMembership(peer *peer, path *table.Path) {
 			// Skips filtering: paths are already scoped to this RT and withdrawals
 			// do not need path attributes.
 			peer.updateRoutes(filtered...)
+			peer.markExportDumpDirty(filtered)
 			sendfsmOutgoingMsg(peer, filtered)
 			return
 		}
@@ -1464,6 +1481,7 @@ func (s *BgpServer) processRTCMembership(peer *peer, path *table.Path) {
 		}
 		filtered = s.processOutgoingPaths(peer, filtered, nil)
 		peer.updateRoutes(filtered...)
+		peer.markExportDumpDirty(filtered)
 		sendfsmOutgoingMsg(peer, filtered)
 	})
 }
@@ -1578,12 +1596,21 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						for _, d := range dsts {
 							toDelete := d.GetWithdrawnPath()
 							toActuallyDelete := make([]*table.Path, 0, len(toDelete))
-							for _, p := range toDelete {
+							// Bendrr (R-212): the destination lookup must use a
+							// global-space path: for VRF-attached peers
+							// filterpath applies ToLocal, whose family/prefix
+							// keys the wrong table and would make the backfill
+							// below a silent no-op.
+							var lookupPath *table.Path
+							for _, withdrawn := range toDelete {
 								// if the path is filtered, there is no need to send the withdrawal
-								p := s.filterpath(targetPeer, p, nil)
+								p := s.filterpath(targetPeer, withdrawn, nil)
 								// the path was never advertized to the peer
 								if p == nil || targetPeer.unsetPathSendMaxFiltered(p) {
 									continue
+								}
+								if lookupPath == nil {
+									lookupPath = withdrawn
 								}
 								toActuallyDelete = append(toActuallyDelete, p)
 							}
@@ -1592,7 +1619,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								continue
 							}
 
-							destination := rib.GetDestination(toActuallyDelete[0])
+							destination := rib.GetDestination(lookupPath)
 							l = append(l, toActuallyDelete...)
 
 							// the destination has been removed from the table
@@ -1601,23 +1628,19 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								continue
 							}
 
+							// Bendrr (R-212): re-derive the ranked export set
+							// instead of promoting only send-max-flagged paths.
+							// While an initial export dump is in flight the
+							// bookkeeping for un-dumped destinations is empty
+							// (no flags set), so the flag-based backfill would
+							// promote nothing — and since this delta marks the
+							// destination dirty (making the dump walk skip
+							// it), the surviving paths would never be
+							// announced at all. The ranked sync computes the
+							// set from the known-path list itself and is a
+							// no-op for already-converged destinations.
 							knownPathList := destination.GetKnownPathList(targetPeer.TableID(), targetPeer.AS())
-							toAdd := make([]*table.Path, 0, len(knownPathList))
-							for _, p := range knownPathList {
-								// If the path is filtered by policies, there is no need to send the path
-								// Otherwise, we send only paths that were previously filtered because of the max path limit
-								p := s.filterpath(targetPeer, p, nil)
-								if p == nil || !targetPeer.isPathSendMaxFiltered(p) {
-									continue
-								}
-								// We unset the flag as the path is not filtered anymore
-								targetPeer.unsetPathSendMaxFiltered(p)
-								toAdd = append(toAdd, p)
-								if len(toAdd) == len(toActuallyDelete) {
-									break
-								}
-							}
-							l = append(l, toAdd...)
+							l = append(l, s.syncRankedAddPathSetFromList(targetPeer, f, knownPathList, nil)...)
 						}
 						targetPeer.updateRoutes(l...)
 						return l
@@ -1657,6 +1680,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 				}
 				if needToAdvertise(targetPeer) && len(bestList) > 0 {
 					// targetPeer.updateRoutes was already called while constructing bestList above.
+					targetPeer.markExportDumpDirty(bestList)
 					sendfsmOutgoingMsg(targetPeer, bestList)
 				}
 			} else {
@@ -1664,6 +1688,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 					if targetPeer.isSecondaryRouteEnabled() {
 						if paths, _ := s.sendSecondaryRoutes(targetPeer, newPath, dsts); len(paths) > 0 {
 							targetPeer.updateRoutes(paths...)
+							targetPeer.markExportDumpDirty(paths)
 							sendfsmOutgoingMsg(targetPeer, paths)
 						}
 						return
@@ -1678,6 +1703,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 				}
 				if paths := s.processOutgoingPaths(targetPeer, bestList, oldList); len(paths) > 0 {
 					targetPeer.updateRoutes(paths...)
+					targetPeer.markExportDumpDirty(paths)
 					sendfsmOutgoingMsg(targetPeer, paths)
 				}
 			}
@@ -1777,6 +1803,9 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 			// Publish the down state before clearing advertised-route state.
 			// This avoids rebuilding RIB-out bookkeeping by propagation that starts after the reset.
 			peer.fsm.state.Store(nextState)
+			// Stop any in-flight export dump walk before the bookkeeping
+			// reset so no chunk's updateRoutes survives it (Bendrr R-212).
+			peer.abortExportDump()
 			s.resetAdvertisedRoutes(peer)
 			s.dropAdjRIBIn(peer, dropFamilies)
 
@@ -1937,11 +1966,15 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 					t := c.RouteTargetMembership.Config.DeferralTime
 					time.AfterFunc(time.Second*time.Duration(t), deferralExpiredFunc(bgp.Family(0), time.Second*time.Duration(t)))
 				} else {
-					s.getBestFromLocalCallback(peer, peer.negotiatedRFList(), true, true, func(paths []*table.Path, filtered []*table.Path) {
-						if len(paths) > 0 {
-							peer.updateRoutes(paths...)
-							sendfsmOutgoingMsg(peer, paths)
-						}
+					// Bendrr (R-212): the initial full-RIB dump used to run
+					// here, synchronously on the FSM callback before the
+					// send/recv loops exist — at scale that is minutes of
+					// wire silence and the peer's hold timer always wins.
+					// Hand it to the async chunked walk, which snapshots only
+					// after fsm.state.Store so live propagation covers
+					// everything newer than the snapshot.
+					s.startExportDump(peer, exportDumpOpts{
+						families: peer.negotiatedRFList(),
 					})
 				}
 			} else {
@@ -1982,11 +2015,12 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 						if !p.isGracefulRestartEnabled() && !peerLocalRestarting {
 							continue
 						}
-						s.getBestFromLocalCallback(p, p.configuredRFlist(), true, true, func(paths []*table.Path, filtered []*table.Path) {
-							if len(paths) > 0 {
-								p.updateRoutes(paths...)
-								sendfsmOutgoingMsg(p, paths)
-							}
+						// Bendrr (R-212): async chunked dump. The walk itself
+						// waits for each peer's ESTABLISHED store, which
+						// matters for the peer transitioning inside this
+						// callback (its store has not run yet).
+						s.startExportDump(p, exportDumpOpts{
+							families: p.configuredRFlist(),
 						})
 					}
 					peer.fsm.logger.Info("sync finished")
@@ -2099,12 +2133,9 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 							if !p.isGracefulRestartEnabled() && !peerLocalRestarting {
 								continue
 							}
-							s.getBestFromLocalCallback(p, p.negotiatedRFList(), true, true, func(paths []*table.Path, filtered []*table.Path) {
-								if len(paths) > 0 {
-									p.updateRoutes(paths...)
-									sendfsmOutgoingMsg(p, paths)
-								}
-							})
+							// Bendrr (R-212): async chunked dump; every peer
+							// here is already established.
+							s.startExportDump(p, exportDumpOpts{families: p.negotiatedRFList()})
 						}
 						s.logger.Info("sync finished",
 							slog.String("Topic", "Server"),
@@ -2141,12 +2172,8 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 							families = append(families, f)
 						}
 					}
-					s.getBestFromLocalCallback(peer, families, true, true, func(paths []*table.Path, filtered []*table.Path) {
-						if len(paths) > 0 {
-							peer.updateRoutes(paths...)
-							sendfsmOutgoingMsg(peer, paths)
-						}
-					})
+					// Bendrr (R-212): async chunked dump.
+					s.startExportDump(peer, exportDumpOpts{families: families})
 				}
 			}
 		}
@@ -3086,39 +3113,15 @@ func (s *BgpServer) softResetOut(addr string, family bgp.Family, deferral bool) 
 			}
 		}
 
-		s.getBestFromLocalCallback(peer, families, true, true, func(paths []*table.Path, filtered []*table.Path) {
-			if len(filtered) > 0 && !deferral {
-				// withdraw paths that export policy now rejects
-				withdrawals := make([]*table.Path, 0, len(filtered))
-				for _, path := range filtered {
-					if path == nil || path.IsEOR() {
-						continue
-					}
-					if !peer.IsFamilyEnabled(path.GetFamily()) {
-						continue
-					}
-					if !peer.hasPathAlreadyBeenSent(path) {
-						continue
-					}
-					withdrawals = append(withdrawals, path.Clone(true))
-				}
-				paths = append(withdrawals, paths...)
-			}
-			if len(paths) > 0 {
-				if deferral {
-					paths = func() []*table.Path {
-						l := make([]*table.Path, 0, len(paths))
-						for _, p := range paths {
-							if !p.IsWithdraw {
-								l = append(l, p)
-							}
-						}
-						return l
-					}()
-				}
-				peer.updateRoutes(paths...)
-				sendfsmOutgoingMsg(peer, paths)
-			}
+		// Bendrr (R-212): the full-RIB regeneration runs on the async
+		// chunked walk. Non-deferral resets additionally withdraw
+		// previously sent paths the export policy now rejects; deferral
+		// resets (GR deferral-timer expiry) strip withdraw paths, exactly
+		// as the synchronous callback used to.
+		s.startExportDump(peer, exportDumpOpts{
+			families:         families,
+			withdrawFiltered: !deferral,
+			dropWithdraws:    deferral,
 		})
 	}
 	return nil
