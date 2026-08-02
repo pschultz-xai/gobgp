@@ -21,7 +21,9 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -551,4 +553,83 @@ func TestExportDumpLiveUpdatesDuringDumpConverge(t *testing.T) {
 			assert.Equal(t, uint32(100), comm, "unchanged destination %s must keep the original value on the wire", prefix)
 		}
 	}
+}
+
+// slowWriteConn throttles writes so a bulk UPDATE batch takes long enough to
+// span keepalive ticks.
+type slowWriteConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c *slowWriteConn) Write(b []byte) (int, error) {
+	time.Sleep(c.delay)
+	return c.Conn.Write(b)
+}
+
+// TestSendMessageloopKeepaliveDuringBulkUpdates: with an oversized queued
+// batch on a slow connection, keepalives are serviced between bounded
+// marshal rounds instead of waiting for the whole batch (R-212 leg 2). The
+// pre-R-212 loop sent zero keepalives until the entire batch was written.
+func TestSendMessageloopKeepaliveDuringBulkUpdates(t *testing.T) {
+	m := NewMockConnection()
+	_, h := makePeerAndHandler(m)
+	t.Cleanup(func() { h.outgoing.Close(); m.Close() })
+
+	// 1s keepalive ticker (the minimum keepaliveTicker grants).
+	h.fsm.lock.Lock()
+	conf := h.fsm.pConf.ReadCopy()
+	conf.Timers.State.NegotiatedHoldTime = 3
+	conf.Timers.State.KeepaliveInterval = 1
+	h.fsm.pConf.Update(&conf)
+	h.fsm.lock.Unlock()
+
+	// Five marshal rounds; ~50ms per wire write makes each round span a few
+	// hundred ms, so the 1s ticker fires while rounds are still pending.
+	const numPaths = 5 * 8192
+	prefixes := exportDumpTestPrefixes(t, numPaths)
+	paths := make([]*table.Path, 0, numPaths)
+	for _, prefix := range prefixes {
+		paths = append(paths, makePath(t, prefix, "192.168.1.1", 0))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stateReasonCh := make(chan fsmStateReason, 3)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go h.sendMessageloop(ctx, &slowWriteConn{Conn: m, delay: 50 * time.Millisecond}, stateReasonCh, wg)
+
+	h.outgoing.In() <- &fsmOutgoingMsg{Paths: paths}
+
+	assert.Eventually(t, func() bool {
+		return countNLRIs(parseBGPUpdates(t, m.GetSentMessages())) >= numPaths
+	}, 60*time.Second, 100*time.Millisecond, "timed out waiting for the bulk batch")
+
+	cancel()
+	wg.Wait()
+
+	msgs := parseBGPUpdates(t, m.GetSentMessages())
+	assert.Equal(t, numPaths, countNLRIs(msgs), "every path exactly once: no drops, no duplicates across marshal rounds")
+	firstUpdate, lastUpdate := -1, -1
+	keepalives := make([]int, 0, 8)
+	for i, msg := range msgs {
+		switch msg.Header.Type {
+		case bgp.BGP_MSG_UPDATE:
+			if firstUpdate < 0 {
+				firstUpdate = i
+			}
+			lastUpdate = i
+		case bgp.BGP_MSG_KEEPALIVE:
+			keepalives = append(keepalives, i)
+		}
+	}
+	require.GreaterOrEqual(t, firstUpdate, 0)
+	interleaved := false
+	for _, k := range keepalives {
+		if k > firstUpdate && k < lastUpdate {
+			interleaved = true
+			break
+		}
+	}
+	assert.True(t, interleaved, "keepalive must be serviced between marshal rounds of one bulk batch (got %d keepalives, updates spanning [%d,%d])", len(keepalives), firstUpdate, lastUpdate)
 }
