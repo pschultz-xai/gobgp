@@ -220,6 +220,176 @@ func TestSessionBehavior_llgrStaleRanksBelowEverything(t *testing.T) {
 	assert.Equal(t, staleNear, d.knownPathList[1])
 }
 
+// R-037 bucket equivalence: EqualThroughLocationMetric defines "same best
+// bucket" membership and must tie exactly when every rankBetterPath step up
+// to and including the location-metric slot ties.
+
+func TestEqualThroughLocationMetric_sameMetricTies(t *testing.T) {
+	defer resetLocationMetric()
+
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+		185: 50,
+		301: 120,
+	})
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	lax := pathWithLocationLC(nil, nlri, 1, 102)
+	fra := pathWithLocationLC(nil, nlri, 2, 185)
+	far := pathWithLocationLC(nil, nlri, 3, 301)
+
+	assert.True(t, EqualThroughLocationMetric(lax, fra),
+		"equal metric, all earlier attributes identical: same bucket")
+	assert.False(t, EqualThroughLocationMetric(lax, far),
+		"different location metric: different bucket")
+	assert.False(t, EqualThroughLocationMetric(fra, far))
+}
+
+func TestEqualThroughLocationMetric_earlierStepsBreakTie(t *testing.T) {
+	defer resetLocationMetric()
+
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+		185: 50,
+	})
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	base := pathWithLocationLC(nil, nlri, 1, 102)
+
+	// Same metric but longer AS_PATH: bucket membership must reject it even
+	// though the location-metric step alone ties.
+	longASPath := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri, ID: 2}, false,
+		[]bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{65001, 65002}),
+			}),
+			bgp.NewPathAttributeLargeCommunities([]*bgp.LargeCommunity{
+				{ASN: testGlobalAdmin, LocalData1: LocationLCDimension, LocalData2: 185},
+			}),
+		}, time.Now(), false)
+	assert.False(t, EqualThroughLocationMetric(base, longASPath),
+		"AS_PATH length difference must break bucket equivalence")
+
+	// Same metric but lower LOCAL_PREF.
+	lowPref := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri, ID: 3}, false,
+		[]bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{65001}),
+			}),
+			bgp.NewPathAttributeLocalPref(50),
+			bgp.NewPathAttributeLargeCommunities([]*bgp.LargeCommunity{
+				{ASN: testGlobalAdmin, LocalData1: LocationLCDimension, LocalData2: 185},
+			}),
+		}, time.Now(), false)
+	assert.False(t, EqualThroughLocationMetric(base, lowPref),
+		"LOCAL_PREF difference must break bucket equivalence")
+}
+
+func TestEqualThroughLocationMetric_localOriginClassSplitsBuckets(t *testing.T) {
+	defer resetLocationMetric()
+
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+		185: 50,
+	})
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	injected := pathWithLocationLC(nil, nlri, 1, 102)
+	ibgpLocal := pathWithLocationLC(newIBGPPeer("10.0.0.1"), nlri, 0, 185)
+
+	// D-042: compareByLocalOrigin separates injected from iBGP-learned
+	// paths before the metric slot, so a bucket never spans the two
+	// classes even at equal metric.
+	assert.False(t, EqualThroughLocationMetric(injected, ibgpLocal))
+}
+
+func TestEqualThroughLocationMetric_disabledTableStillComparesEarlierSteps(t *testing.T) {
+	defer resetLocationMetric()
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	// No metric table mounted: the metric step is a universal tie, so
+	// equivalence degrades to the earlier steps (whole ranked list becomes
+	// one bucket when attributes are identical).
+	p1 := pathWithLocationLC(nil, nlri, 1, 102)
+	p2 := pathWithLocationLC(nil, nlri, 2, 185)
+	assert.True(t, EqualThroughLocationMetric(p1, p2))
+
+	missing := pathWithoutLocationLC(nil, nlri)
+	assert.True(t, EqualThroughLocationMetric(p1, missing),
+		"missing LC is also a tie when the comparator is disabled")
+}
+
+func TestEqualThroughLocationMetric_missingSentinelBucket(t *testing.T) {
+	defer resetLocationMetric()
+
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+	})
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	known := pathWithLocationLC(nil, nlri, 1, 102)
+	missing1 := pathWithoutLocationLC(nil, nlri)
+	missing2 := pathWithLocationLC(nil, nlri, 2, 999)
+
+	assert.False(t, EqualThroughLocationMetric(known, missing1),
+		"sentinel metric differs from a real metric")
+	assert.True(t, EqualThroughLocationMetric(missing1, missing2),
+		"two sentinel-metric paths tie (degenerate sentinel bucket)")
+}
+
+// R-037: compareByMED only compares paths whose leftmost AS matches (absent
+// always-compare-med), so bucket equivalence is NOT transitive — the reason
+// exportSelector tests every candidate against the anchor instead of
+// assuming bucket members form a contiguous ranked prefix. Pin the
+// non-transitive triple: a~b and b~c but NOT a~c.
+func TestEqualThroughLocationMetricMEDNonTransitive(t *testing.T) {
+	defer resetLocationMetric()
+
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+	})
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	withASAndMED := func(pathID uint32, asn, med uint32) *Path {
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{asn}),
+			}),
+			bgp.NewPathAttributeMultiExitDisc(med),
+			bgp.NewPathAttributeLargeCommunities([]*bgp.LargeCommunity{
+				{ASN: testGlobalAdmin, LocalData1: LocationLCDimension, LocalData2: 102},
+			}),
+		}
+		return NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri, ID: pathID}, false, attrs, time.Now(), false)
+	}
+
+	a := withASAndMED(1, 65001, 10)
+	b := withASAndMED(2, 65002, 500)
+	c := withASAndMED(3, 65001, 20)
+
+	assert.True(t, EqualThroughLocationMetric(a, b),
+		"different leftmost AS: MED incomparable, ties")
+	assert.True(t, EqualThroughLocationMetric(b, c),
+		"different leftmost AS: MED incomparable, ties")
+	assert.False(t, EqualThroughLocationMetric(a, c),
+		"same leftmost AS, different MED: no tie — equivalence is non-transitive")
+}
+
 func resetLocationMetric() {
 	ResetLocationMetric()
 }
