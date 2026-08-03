@@ -48,17 +48,18 @@ func TestReSortAfterLocationMetricSwap(t *testing.T) {
 	require.Equal(t, []*Path{lax, fra}, d.knownPathList, "map A must rank lax first")
 
 	// Same map content: reSort is a no-op and reports no change.
-	u, changed := d.reSort()
+	u, changed := d.reSort(CurrentLocationMetric(), false)
 	assert.False(t, changed)
 	assert.Nil(t, u)
 
 	// Map B inverts the distances: fra must now rank first.
+	oldTbl := CurrentLocationMetric()
 	installTestLocationMetric(104, map[uint32]uint32{
 		102: 90,
 		185: 30,
 	})
 
-	u, changed = d.reSort()
+	u, changed = d.reSort(oldTbl, true)
 	require.True(t, changed, "inverted metrics must re-rank the destination")
 	assert.Equal(t, []*Path{lax, fra}, u.OldKnownPathList)
 	assert.Equal(t, []*Path{fra, lax}, u.KnownPathList)
@@ -70,14 +71,16 @@ func TestReSortAfterLocationMetricSwap(t *testing.T) {
 	assert.Equal(t, lax, old)
 
 	// Idempotent: a second pass under map B reports no change.
-	_, changed = d.reSort()
+	_, changed = d.reSort(CurrentLocationMetric(), false)
 	assert.False(t, changed)
 }
 
-// A tie under the new map must keep the current relative order (stable
-// sort) and report no change, so an unchanged comparator input costs no
-// export work.
-func TestReSortStableOnTies(t *testing.T) {
+// R-037 pin: a reload that changes bucket membership WITHOUT moving the
+// ranked order must still report the destination changed, or the export
+// selection never re-runs and a peer keeps a stale bucket cut. Both
+// directions: a tie merging (bucket widens — a path must be announced) and
+// a tie splitting (bucket narrows — a path must be withdrawn).
+func TestReSortReportsBucketPartitionChange(t *testing.T) {
 	defer resetLocationMetric()
 
 	installTestLocationMetric(104, map[uint32]uint32{
@@ -88,34 +91,60 @@ func TestReSortStableOnTies(t *testing.T) {
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
 	require.NoError(t, err)
 
-	lax := pathWithLocationLC(nil, nlri, 1, 102)
-	fra := pathWithLocationLC(nil, nlri, 2, 185)
+	// Distinct iBGP sources with ordered router IDs so the full-tie
+	// tie-break (router ID) actively prefers lax rather than leaving a
+	// complete tie: source-less local paths now tie all the way down
+	// (compareByNeighborAddress declares two invalid-address paths a
+	// genuine tie since the R-037 round-2 fix), which would also work
+	// via stable sort, but an explicit ordering keeps the intent loud.
+	laxSrc := &PeerInfo{AS: 65000, LocalAS: 65000,
+		ID: netip.MustParseAddr("1.1.1.1"), Address: netip.MustParseAddr("10.0.0.1")}
+	fraSrc := &PeerInfo{AS: 65000, LocalAS: 65000,
+		ID: netip.MustParseAddr("2.2.2.2"), Address: netip.MustParseAddr("10.0.0.2")}
+	lax := pathWithLocationLC(laxSrc, nlri, 1, 102)
+	fra := pathWithLocationLC(fraSrc, nlri, 2, 185)
 
 	d := newDestination(nlri, 64)
 	d.localIdMap.Flag(0)
-	d.Calculate(logger, fra)
 	d.Calculate(logger, lax)
+	d.Calculate(logger, fra)
+	require.Equal(t, []*Path{lax, fra}, d.knownPathList)
 
-	// Map B makes the two locations equidistant: everything ties through
-	// the location-metric slot, later comparators (age, etc.) decide — but
-	// the stable sort must not report a spurious change when the resulting
-	// order matches the current one.
+	// Tie merge: 30/90 -> 50/50. The order stays lax-first (metric under
+	// map A, router ID under map B), but fra joins lax's bucket and must
+	// be re-exported.
+	oldTbl := CurrentLocationMetric()
 	installTestLocationMetric(104, map[uint32]uint32{
 		102: 50,
 		185: 50,
 	})
+	u, changed := d.reSort(oldTbl, true)
+	require.True(t, changed, "tie merge must report a change despite stable order")
+	assert.Equal(t, []*Path{lax, fra}, u.OldKnownPathList)
+	assert.Equal(t, []*Path{lax, fra}, u.KnownPathList, "order must not move")
+	assert.True(t, EqualThroughLocationMetric(lax, fra))
 
-	before := make([]*Path, len(d.knownPathList))
-	copy(before, d.knownPathList)
-	u, changed := d.reSort()
-	if changed {
-		// Order legitimately changed via a later comparator; accept but the
-		// diff must be internally consistent.
-		assert.Equal(t, before, u.OldKnownPathList)
-		assert.Equal(t, d.knownPathList, u.KnownPathList)
-	} else {
-		assert.Equal(t, before, d.knownPathList)
-	}
+	// Tie split: 50/50 -> 50/80. Order holds (lax still first), but fra
+	// leaves the bucket and must be withdrawn from bucket-mode peers.
+	oldTbl = CurrentLocationMetric()
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+		185: 80,
+	})
+	u, changed = d.reSort(oldTbl, true)
+	require.True(t, changed, "tie split must report a change despite stable order")
+	assert.Equal(t, []*Path{lax, fra}, u.KnownPathList, "order must not move")
+	assert.False(t, EqualThroughLocationMetric(lax, fra))
+
+	// Metric values move but the partition and order both hold
+	// (50/80 -> 55/85): nothing to re-export, no change reported.
+	oldTbl = CurrentLocationMetric()
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 55,
+		185: 85,
+	})
+	_, changed = d.reSort(oldTbl, true)
+	assert.False(t, changed, "value drift preserving the partition must not re-export")
 }
 
 // D-066: the TableManager walk must visit every destination, re-sort only
@@ -141,13 +170,14 @@ func TestReRankDestinationsWalk(t *testing.T) {
 	require.NoError(t, err)
 	tm.Update(pathWithLocationLC(nil, nlri2, 1, 102))
 
+	oldTbl := CurrentLocationMetric()
 	installTestLocationMetric(104, map[uint32]uint32{
 		102: 90,
 		185: 30,
 	})
 
 	var got []*Update
-	total, changed := tm.ReRankDestinations(func(us []*Update) {
+	total, changed := tm.ReRankDestinations(oldTbl, func(us []*Update) {
 		got = append(got, us...)
 	})
 	assert.Equal(t, 2, total)
@@ -158,7 +188,7 @@ func TestReRankDestinationsWalk(t *testing.T) {
 		"fra path must rank first under the inverted map")
 
 	// Second walk: nothing left to re-rank.
-	total, changed = tm.ReRankDestinations(nil)
+	total, changed = tm.ReRankDestinations(CurrentLocationMetric(), nil)
 	assert.Equal(t, 2, total)
 	assert.Equal(t, 0, changed)
 }

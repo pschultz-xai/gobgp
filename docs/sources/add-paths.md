@@ -54,6 +54,26 @@ unicast family.
       send-max = 8
 ```
 
+### Bucket-aware export selection (Bendrr fork extension)
+
+This fork adds two optional keys beside `send-max` (R-037). When
+`lowest-igp-max` is non-zero, the exported set per prefix is not the flat
+top-`send-max` of ranked order but: up to `lowest-igp-max` paths tying with
+the best path through the location-metric comparator slot (the "best
+bucket"), padded with next-ranked backup paths up to `min-paths` when the
+bucket is thin. `send-max` remains the absolute ceiling, and leaving both
+keys unset preserves upstream flat behavior. Changing the two keys on a
+running daemon does not bounce the session; the export set is re-synced in
+place.
+
+```toml
+    [neighbors.afi-safis.add-paths.config]
+      receive = true
+      send-max = 8
+      lowest-igp-max = 4
+      min-paths = 2
+```
+
 ## Verification
 
 ### Example Topology and Configuration

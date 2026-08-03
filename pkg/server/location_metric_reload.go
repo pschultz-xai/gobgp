@@ -36,7 +36,8 @@ type LocationMetricReloadStats struct {
 	MapChanged bool
 	// RibDestinations is the number of destinations examined.
 	RibDestinations int
-	// RerankedDestinations is the number whose best-path order changed.
+	// RerankedDestinations is the number whose best-path order or R-037
+	// bucket partition changed (either requires re-export).
 	RerankedDestinations int
 	// AnnouncedPaths / WithdrawnPaths are UPDATE messages queued to peers
 	// as a result of the re-rank (across all peers).
@@ -103,6 +104,7 @@ func (s *BgpServer) ReloadLocationMetric(mapPath, registryPath string, dryRun bo
 			return nil
 		}
 
+		oldTbl := table.CurrentLocationMetric()
 		table.InstallLocationMetric(newTbl)
 
 		// The management operation holds the server lock exclusively, so no
@@ -110,7 +112,9 @@ func (s *BgpServer) ReloadLocationMetric(mapPath, registryPath string, dryRun bo
 		// bookkeeping during the walk; per-prefix propagation bucket locks
 		// are subsumed by that exclusivity. Off-loop readers (ListPath,
 		// soft-reconfig) stay safe via shard locks and the peer.advMu leaf.
-		total, changed := s.globalRib.ReRankDestinations(func(dsts []*table.Update) {
+		// oldTbl lets the walk catch destinations whose bucket membership
+		// changed without the ranked order moving (R-037).
+		total, changed := s.globalRib.ReRankDestinations(oldTbl, func(dsts []*table.Update) {
 			s.propagateReRankedDestinations(dsts, stats)
 		})
 		stats.RibDestinations = total
@@ -119,7 +123,7 @@ func (s *BgpServer) ReloadLocationMetric(mapPath, registryPath string, dryRun bo
 		// Route-server RIBs must keep the sorted invariant too, but Bendrr
 		// runs no route-server clients and their per-client views are not
 		// re-exported here.
-		if _, rsChanged := s.rsRib.ReRankDestinations(nil); rsChanged > 0 {
+		if _, rsChanged := s.rsRib.ReRankDestinations(oldTbl, nil); rsChanged > 0 {
 			s.logger.Warn("Location-metric reload re-ranked route-server RIB destinations; route-server client views are not re-exported",
 				slog.String("Topic", "Config"),
 				slog.Int("Destinations", rsChanged))
@@ -183,8 +187,9 @@ func (s *BgpServer) propagateReRankedDestinations(dsts []*table.Update, stats *L
 			paths := make([]*table.Path, 0, len(dsts))
 			var plainBest, plainOld []*table.Path
 			for i, u := range dsts {
-				// reSort reports a change only when order moved, which
-				// needs at least two paths, so KnownPathList is non-empty.
+				// reSort reports a change only when order or bucket
+				// partition moved, either of which needs at least two
+				// paths, so KnownPathList is non-empty.
 				f := u.KnownPathList[0].GetFamily()
 				if peerVrf != "" {
 					switch f {

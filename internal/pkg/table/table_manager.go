@@ -471,10 +471,14 @@ func (manager *TableManager) GetPathListWithSource(id string, rfList []bgp.Famil
 }
 
 // ReRankDestinations re-sorts every destination in every table under the
-// current best-path comparator chain. Needed when a global comparator input
-// changes out from under already-sorted knownPathLists — the D-066
-// location-metric map reload — because insertSort relies on the sorted
-// invariant for every future incremental update.
+// currently installed location-metric table. Needed when a global
+// comparator input changes out from under already-sorted knownPathLists —
+// the D-066 location-metric map reload — because insertSort relies on the
+// sorted invariant for every future incremental update. oldTbl is the
+// table that was installed before the reload swap; it feeds the
+// bucket-membership change detection in reSort (a destination whose ranked
+// order held but whose metric partition moved still needs re-export under
+// R-037 bucket-aware selection).
 //
 // It processes one shard at a time: the shard write lock is held for the
 // re-sort only, then fn is invoked with the shard's diffs after the lock is
@@ -485,9 +489,14 @@ func (manager *TableManager) GetPathListWithSource(id string, rfList []bgp.Famil
 // The caller must guarantee no concurrent table mutation for the whole walk
 // (the BgpServer runs this inside a mgmt operation, which holds the server
 // lock exclusively).
-func (manager *TableManager) ReRankDestinations(fn func([]*Update)) (int, int) {
+func (manager *TableManager) ReRankDestinations(oldTbl *LocationMetricTable, fn func([]*Update)) (int, int) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
+
+	// Loop-invariant: the full-map table comparison must not run per
+	// destination under the shard write lock (it scales as destinations
+	// times map size).
+	tablesDiffer := !oldTbl.Equal(CurrentLocationMetric())
 
 	total, changed := 0, 0
 	for _, t := range manager.tables {
@@ -497,7 +506,7 @@ func (manager *TableManager) ReRankDestinations(fn func([]*Update)) (int, int) {
 			for _, dests := range shard.mp {
 				for _, dest := range dests {
 					total++
-					if u, ok := dest.reSort(); ok {
+					if u, ok := dest.reSort(oldTbl, tablesDiffer); ok {
 						updates = append(updates, u)
 					}
 				}
