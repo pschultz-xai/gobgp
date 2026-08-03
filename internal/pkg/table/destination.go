@@ -546,11 +546,15 @@ func (dest *destination) insertSort(newPath *Path) {
 // oldTbl is the table that was installed before the reload swap; when the
 // per-path metric partition differs between oldTbl and the currently
 // installed table, the destination is reported changed even if the order
-// held, so the reload re-runs export selection for it.
+// held, so the reload re-runs export selection for it. tablesDiffer is
+// !oldTbl.Equal(CurrentLocationMetric()), computed ONCE by the walk —
+// hoisted out of here because the full-map comparison is loop-invariant
+// and this runs per destination under the shard write lock (round-2
+// review NEW-8).
 //
 // INTERNAL USE ONLY: caller MUST hold the appropriate shard lock and must
 // NEVER call this on snapshot destinations.
-func (dest *destination) reSort(oldTbl *LocationMetricTable) (*Update, bool) {
+func (dest *destination) reSort(oldTbl *LocationMetricTable, tablesDiffer bool) (*Update, bool) {
 	oldKnownPathList := make([]*Path, len(dest.knownPathList))
 	copy(oldKnownPathList, dest.knownPathList)
 
@@ -565,7 +569,7 @@ func (dest *destination) reSort(oldTbl *LocationMetricTable) (*Update, bool) {
 			break
 		}
 	}
-	if !changed && metricPartitionChanged(oldTbl, CurrentLocationMetric(), dest.knownPathList) {
+	if !changed && tablesDiffer && metricPartitionChanged(oldTbl, CurrentLocationMetric(), dest.knownPathList) {
 		changed = true
 	}
 	if !changed {
@@ -589,9 +593,11 @@ func (dest *destination) reSort(oldTbl *LocationMetricTable) (*Update, bool) {
 // conservative: it ignores whether a differing pair also ties on the
 // non-metric steps, so it can report true for destinations whose export set
 // is in fact unchanged — the re-export sync is idempotent and emits nothing
-// for those.
+// for those. Callers gate on the tables actually differing (reSort's
+// tablesDiffer); the loop-invariant oldTbl.Equal check lives in
+// ReRankDestinations, not here.
 func metricPartitionChanged(oldTbl, newTbl *LocationMetricTable, paths []*Path) bool {
-	if len(paths) < 2 || oldTbl.Equal(newTbl) {
+	if len(paths) < 2 {
 		return false
 	}
 	// The partition is unchanged iff old-metric ↔ new-metric is a
@@ -993,11 +999,20 @@ func compareByNeighborAddress(path1, path2 *Path) *Path {
 	// Select the route received from the peer with the lowest peer address as
 	// per RFC 4271 9.1.2.2. g
 
+	// Two source-less paths (both locally injected) are a genuine tie.
+	// Returning path1 here — the historical behavior — made this a
+	// first-argument-wins comparison, which is not a valid ordering:
+	// sort.SliceStable permutes such ties arbitrarily, so every D-066
+	// metric reload could reshuffle fully-tied local paths and churn
+	// exports for no input change (R-037 round-2 review).
 	p1 := path1.GetSource().Address
+	p2 := path2.GetSource().Address
+	if !p1.IsValid() && !p2.IsValid() {
+		return nil
+	}
 	if !p1.IsValid() {
 		return path1
 	}
-	p2 := path2.GetSource().Address
 	if !p2.IsValid() {
 		return path2
 	}

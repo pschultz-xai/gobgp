@@ -219,6 +219,17 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 		}
 	}
 
+	// Validate the R-037 bucket knobs on the effective (post-merge)
+	// per-AFI-SAFI configs — the surface export selection actually reads.
+	// This funnel covers every delivery path: TOML file load, gRPC
+	// add/update, and peer-group inheritance.
+	for i := range n.AfiSafis {
+		if err := n.AfiSafis[i].AddPaths.Config.ValidateExportSelection(); err != nil {
+			return fmt.Errorf("neighbor %s afi-safi %s: %w",
+				n.State.NeighborAddress, n.AfiSafis[i].Config.AfiSafiName, err)
+		}
+	}
+
 	n.State.Description = n.Config.Description
 	n.State.AdminDown = n.Config.AdminDown
 

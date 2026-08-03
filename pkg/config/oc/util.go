@@ -217,6 +217,32 @@ func (lhs *AddPathsConfig) EqualNegotiated(rhs *AddPathsConfig) bool {
 	return lhs.Receive == rhs.Receive && lhs.SendMax == rhs.SendMax
 }
 
+// ValidateExportSelection rejects unusable R-037 bucket-knob combinations
+// at the config boundary, whatever the delivery surface (TOML file, gRPC
+// add/update, peer-group inheritance, hand-written static config). The
+// knobs are both-or-neither, require a SendMax ceiling, and must satisfy
+// 1 <= min-paths <= lowest-igp-max <= send-max; a violation would
+// otherwise be applied silently with selection behavior nobody specified
+// (round-2 review NEW-5). Zero on both knobs is the documented flat mode.
+func (c *AddPathsConfig) ValidateExportSelection() error {
+	if c.LowestIgpMax == 0 && c.MinPaths == 0 {
+		return nil
+	}
+	if c.LowestIgpMax == 0 || c.MinPaths == 0 {
+		return fmt.Errorf("add-paths lowest-igp-max and min-paths must be set together (lowest-igp-max=%d, min-paths=%d)", c.LowestIgpMax, c.MinPaths)
+	}
+	if c.SendMax == 0 {
+		return fmt.Errorf("add-paths lowest-igp-max/min-paths require send-max (the export ceiling) to be set")
+	}
+	if c.MinPaths > c.LowestIgpMax {
+		return fmt.Errorf("add-paths min-paths (%d) must not exceed lowest-igp-max (%d)", c.MinPaths, c.LowestIgpMax)
+	}
+	if c.LowestIgpMax > c.SendMax {
+		return fmt.Errorf("add-paths lowest-igp-max (%d) must not exceed send-max (%d)", c.LowestIgpMax, c.SendMax)
+	}
+	return nil
+}
+
 func isAfiSafiChanged(x, y []AfiSafi) bool {
 	if len(x) != len(y) {
 		return true

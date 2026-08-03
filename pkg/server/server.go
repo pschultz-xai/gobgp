@@ -3669,6 +3669,18 @@ func (s *BgpServer) addPeerGroup(c *oc.PeerGroup) error {
 		return fmt.Errorf("can't overwrite the existing peer-group: %s", name)
 	}
 
+	// Members validate their effective config on add, but a group can sit
+	// memberless; reject unusable R-037 bucket knobs at definition time.
+	if err := c.AddPaths.Config.ValidateExportSelection(); err != nil {
+		return fmt.Errorf("peer-group %s: %w", name, err)
+	}
+	for i := range c.AfiSafis {
+		if err := c.AfiSafis[i].AddPaths.Config.ValidateExportSelection(); err != nil {
+			return fmt.Errorf("peer-group %s afi-safi %s: %w",
+				name, c.AfiSafis[i].Config.AfiSafiName, err)
+		}
+	}
+
 	s.logger.Info("Add a peer group configuration",
 		slog.String("Topic", "Peer"),
 		slog.String("Name", name))
@@ -4132,29 +4144,31 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 
 	// Bendrr R-037: the bucket-aware export knobs are excluded from
 	// EqualNegotiated, so a knob-only change reaches this non-bounce path.
-	// Apply the new values in place and re-sync the peer's export set with
-	// a non-deferral soft reset out below: the async dump announces the new
-	// cut and withdraws previously sent paths the new selection rejects.
-	exportKnobsChanged := false
-	if original.AddPaths.Config.LowestIgpMax != c.AddPaths.Config.LowestIgpMax ||
-		original.AddPaths.Config.MinPaths != c.AddPaths.Config.MinPaths {
-		conf.AddPaths.Config.LowestIgpMax = c.AddPaths.Config.LowestIgpMax
-		conf.AddPaths.Config.MinPaths = c.AddPaths.Config.MinPaths
-		exportKnobsChanged = true
-	}
-	for i := range conf.AfiSafis {
-		nc := c.GetAfiSafi(conf.AfiSafis[i].State.Family)
-		if nc == nil {
-			continue
-		}
-		ac := &conf.AfiSafis[i].AddPaths.Config
-		if ac.LowestIgpMax != nc.AddPaths.Config.LowestIgpMax ||
-			ac.MinPaths != nc.AddPaths.Config.MinPaths {
-			ac.LowestIgpMax = nc.AddPaths.Config.LowestIgpMax
-			ac.MinPaths = nc.AddPaths.Config.MinPaths
-			exportKnobsChanged = true
+	// Detect the change here (read-only: the effective per-AFI-SAFI values
+	// land via updatePrefixLimitConfig below, which replaces conf.AfiSafis
+	// with c.AfiSafis wholesale) and re-sync the peer's export set with a
+	// non-deferral soft reset out: the async dump announces the new cut
+	// and withdraws previously sent paths the new selection rejects.
+	exportKnobsChanged := original.AddPaths.Config.LowestIgpMax != c.AddPaths.Config.LowestIgpMax ||
+		original.AddPaths.Config.MinPaths != c.AddPaths.Config.MinPaths
+	if !exportKnobsChanged {
+		for i := range conf.AfiSafis {
+			nc := c.GetAfiSafi(conf.AfiSafis[i].State.Family)
+			if nc == nil {
+				continue
+			}
+			ac := &conf.AfiSafis[i].AddPaths.Config
+			if ac.LowestIgpMax != nc.AddPaths.Config.LowestIgpMax ||
+				ac.MinPaths != nc.AddPaths.Config.MinPaths {
+				exportKnobsChanged = true
+				break
+			}
 		}
 	}
+	// Keep the neighbor-level copy in sync so later Equal-based diffs see
+	// the applied values (per-AFI-SAFI copies are replaced below).
+	conf.AddPaths.Config.LowestIgpMax = c.AddPaths.Config.LowestIgpMax
+	conf.AddPaths.Config.MinPaths = c.AddPaths.Config.MinPaths
 	if exportKnobsChanged {
 		peer.fsm.logger.Info("Update ADD-PATH export selection knobs without session bounce",
 			slog.Uint64("LowestIgpMax", uint64(c.AddPaths.Config.LowestIgpMax)),

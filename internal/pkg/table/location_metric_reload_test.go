@@ -48,7 +48,7 @@ func TestReSortAfterLocationMetricSwap(t *testing.T) {
 	require.Equal(t, []*Path{lax, fra}, d.knownPathList, "map A must rank lax first")
 
 	// Same map content: reSort is a no-op and reports no change.
-	u, changed := d.reSort(CurrentLocationMetric())
+	u, changed := d.reSort(CurrentLocationMetric(), false)
 	assert.False(t, changed)
 	assert.Nil(t, u)
 
@@ -59,7 +59,7 @@ func TestReSortAfterLocationMetricSwap(t *testing.T) {
 		185: 30,
 	})
 
-	u, changed = d.reSort(oldTbl)
+	u, changed = d.reSort(oldTbl, true)
 	require.True(t, changed, "inverted metrics must re-rank the destination")
 	assert.Equal(t, []*Path{lax, fra}, u.OldKnownPathList)
 	assert.Equal(t, []*Path{fra, lax}, u.KnownPathList)
@@ -71,7 +71,7 @@ func TestReSortAfterLocationMetricSwap(t *testing.T) {
 	assert.Equal(t, lax, old)
 
 	// Idempotent: a second pass under map B reports no change.
-	_, changed = d.reSort(CurrentLocationMetric())
+	_, changed = d.reSort(CurrentLocationMetric(), false)
 	assert.False(t, changed)
 }
 
@@ -92,10 +92,11 @@ func TestReSortReportsBucketPartitionChange(t *testing.T) {
 	require.NoError(t, err)
 
 	// Distinct iBGP sources with ordered router IDs so the full-tie
-	// tie-break (router ID) is deterministic and prefers lax: source-less
-	// local paths tie all the way down to the asymmetric
-	// compareByNeighborAddress fallback, which does not order two
-	// invalid-address paths consistently.
+	// tie-break (router ID) actively prefers lax rather than leaving a
+	// complete tie: source-less local paths now tie all the way down
+	// (compareByNeighborAddress declares two invalid-address paths a
+	// genuine tie since the R-037 round-2 fix), which would also work
+	// via stable sort, but an explicit ordering keeps the intent loud.
 	laxSrc := &PeerInfo{AS: 65000, LocalAS: 65000,
 		ID: netip.MustParseAddr("1.1.1.1"), Address: netip.MustParseAddr("10.0.0.1")}
 	fraSrc := &PeerInfo{AS: 65000, LocalAS: 65000,
@@ -117,7 +118,7 @@ func TestReSortReportsBucketPartitionChange(t *testing.T) {
 		102: 50,
 		185: 50,
 	})
-	u, changed := d.reSort(oldTbl)
+	u, changed := d.reSort(oldTbl, true)
 	require.True(t, changed, "tie merge must report a change despite stable order")
 	assert.Equal(t, []*Path{lax, fra}, u.OldKnownPathList)
 	assert.Equal(t, []*Path{lax, fra}, u.KnownPathList, "order must not move")
@@ -130,7 +131,7 @@ func TestReSortReportsBucketPartitionChange(t *testing.T) {
 		102: 50,
 		185: 80,
 	})
-	u, changed = d.reSort(oldTbl)
+	u, changed = d.reSort(oldTbl, true)
 	require.True(t, changed, "tie split must report a change despite stable order")
 	assert.Equal(t, []*Path{lax, fra}, u.KnownPathList, "order must not move")
 	assert.False(t, EqualThroughLocationMetric(lax, fra))
@@ -142,7 +143,7 @@ func TestReSortReportsBucketPartitionChange(t *testing.T) {
 		102: 55,
 		185: 85,
 	})
-	_, changed = d.reSort(oldTbl)
+	_, changed = d.reSort(oldTbl, true)
 	assert.False(t, changed, "value drift preserving the partition must not re-export")
 }
 
