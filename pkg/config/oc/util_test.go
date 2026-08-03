@@ -61,6 +61,93 @@ func TestIsAfiSafiChanged(t *testing.T) {
 	assert.True(t, isAfiSafiChanged(old, new))
 }
 
+// R-037 round-2 (NEW-5): the fork itself must reject unusable bucket-knob
+// combinations at the config boundary — bendrr's client-side guards do not
+// cover hand-written static config, the gobgp CLI, or direct gRPC callers.
+func TestValidateExportSelection(t *testing.T) {
+	valid := []AddPathsConfig{
+		{},           // flat mode, no knobs
+		{SendMax: 4}, // flat mode with ceiling
+		{SendMax: 4, LowestIgpMax: 4, MinPaths: 2},
+		{SendMax: 255, LowestIgpMax: 255, MinPaths: 255}, // uint8 ceiling
+		{SendMax: 4, LowestIgpMax: 1, MinPaths: 1},
+	}
+	for _, c := range valid {
+		assert.NoError(t, c.ValidateExportSelection(), "%+v", c)
+	}
+
+	invalid := []AddPathsConfig{
+		{SendMax: 4, LowestIgpMax: 4},              // unpaired: no min-paths
+		{SendMax: 4, MinPaths: 2},                  // unpaired: no lowest-igp-max
+		{LowestIgpMax: 4, MinPaths: 2},             // knobs without send-max
+		{SendMax: 4, LowestIgpMax: 2, MinPaths: 3}, // min-paths > lowest-igp-max
+		{SendMax: 4, LowestIgpMax: 5, MinPaths: 2}, // lowest-igp-max > send-max
+	}
+	for _, c := range invalid {
+		assert.Error(t, c.ValidateExportSelection(), "%+v", c)
+	}
+}
+
+// The neighbor default-values funnel — shared by TOML load, gRPC
+// add/update, and peer-group inheritance — must apply the validation on
+// the effective per-AFI-SAFI configs.
+func TestSetDefaultNeighborConfigValuesRejectsBadKnobs(t *testing.T) {
+	g := &Global{Config: GlobalConfig{As: 65001, RouterId: netip.MustParseAddr("1.1.1.1")}}
+	n := &Neighbor{
+		Config: NeighborConfig{
+			NeighborAddress: netip.MustParseAddr("192.0.2.1"),
+			PeerAs:          65001,
+		},
+		AddPaths: AddPaths{
+			Config: AddPathsConfig{SendMax: 4, LowestIgpMax: 4}, // no min-paths
+		},
+	}
+	err := SetDefaultNeighborConfigValues(n, nil, g)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "min-paths")
+}
+
+// R-037: a knob-only ADD-PATH change must be VISIBLE to generic config
+// change detection (Equal / Neighbor.Equal — this is what the file-reload
+// diff uses, so excluding the knobs there made a knob-only TOML reload a
+// silent no-op) while staying INVISIBLE to the session-bounce checks
+// (EqualNegotiated / NeedsResendOpenMessage / isAfiSafiChanged).
+func TestAddPathsBucketKnobsChangeDetection(t *testing.T) {
+	base := AddPathsConfig{Receive: true, SendMax: 4}
+	knobbed := AddPathsConfig{Receive: true, SendMax: 4, LowestIgpMax: 4, MinPaths: 2}
+
+	assert.False(t, base.Equal(&knobbed),
+		"structural equality must see the knob change or config reloads drop it")
+	assert.True(t, base.EqualNegotiated(&knobbed),
+		"knob-only changes must not require a session bounce")
+
+	moreSendMax := base
+	moreSendMax.SendMax = 8
+	assert.False(t, base.EqualNegotiated(&moreSendMax),
+		"SendMax keeps its historical bounce semantics")
+
+	mkNeighbor := func(ap AddPathsConfig) *Neighbor {
+		return &Neighbor{
+			Config: NeighborConfig{
+				NeighborAddress: netip.MustParseAddr("192.0.2.1"),
+				PeerAs:          65001,
+			},
+			AfiSafis: []AfiSafi{
+				{
+					Config:   AfiSafiConfig{AfiSafiName: AFI_SAFI_TYPE_IPV4_UNICAST},
+					AddPaths: AddPaths{Config: ap},
+				},
+			},
+		}
+	}
+	nBase, nKnobbed := mkNeighbor(base), mkNeighbor(knobbed)
+	assert.False(t, nBase.Equal(nKnobbed),
+		"Neighbor.Equal drives UpdateNeighborConfig's changed-list on file reload")
+	assert.False(t, nBase.NeedsResendOpenMessage(nKnobbed),
+		"knob-only changes take the in-place apply path, not the del/add bounce")
+	assert.False(t, isAfiSafiChanged(nBase.AfiSafis, nKnobbed.AfiSafis))
+}
+
 func newPeerFromConfigForBFDTest(t *testing.T, bfd Bfd) *api.Peer {
 	t.Helper()
 	n := &Neighbor{

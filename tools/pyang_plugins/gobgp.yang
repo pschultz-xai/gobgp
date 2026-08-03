@@ -1443,17 +1443,52 @@ module gobgp {
     uses long-lived-graceful-restart;
   }
 
+  grouping bendrr-add-paths-selection-config {
+    description
+      "Bendrr R-037 bucket-aware ADD-PATH export selection knobs. Shared
+      by every add-paths config surface the daemon reads them from:
+      neighbor, peer-group, and the per-AFI-SAFI containers.";
+    leaf lowest-igp-max {
+      description
+        "Bendrr R-037 bucket-aware ADD-PATH export selection. When
+        non-zero, the export set for a destination is not the flat
+        top-send-max of ranked order but: up to lowest-igp-max paths that
+        tie with the best path through the location-metric comparator
+        slot (the best bucket), padded with next-ranked paths up to
+        min-paths when the bucket is thin. send-max remains the absolute
+        ceiling. Zero disables bucketing (flat top-send-max).";
+      type uint8;
+    }
+    leaf min-paths {
+      description
+        "Floor for bucket-aware selection: when the best bucket exports
+        fewer than min-paths paths, next-ranked paths outside the bucket
+        fill up to this count (pre-programmed backups). Meaningful only
+        with lowest-igp-max > 0.";
+      type uint8;
+    }
+  }
+
   augment "/bgp:bgp/bgp:global/bgp:afi-safis/bgp:afi-safi" {
     container add-paths {
       description
         "add-paths configuration options related to a particular AFI-SAFI.";
       container config {
           uses bgp:bgp-neighbor-add-paths_config;
+          uses bendrr-add-paths-selection-config;
       }
       container state {
           uses bgp:bgp-neighbor-add-paths_config;
       }
     }
+  }
+
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:add-paths/bgp:config" {
+    uses bendrr-add-paths-selection-config;
+  }
+
+  augment "/bgp:bgp/bgp:peer-groups/bgp:peer-group/bgp:add-paths/bgp:config" {
+    uses bendrr-add-paths-selection-config;
   }
 
   augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:as-path-options/bgp:config" {

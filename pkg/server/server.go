@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/netip"
 	"slices"
@@ -1093,26 +1092,24 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 // re-announcing the path with that local key even when it has already been
 // sent (used when that path's attributes just changed); the D-066 metric-map
 // re-rank passes nil because no path content changed — only rank order — so
-// already-advertised paths that stay inside the SendMax cut cost nothing.
+// already-advertised paths that stay inside the selection cut cost nothing.
+//
+// Which survivors are exported is the exportSelector's decision (flat
+// top-SendMax, or the R-037 best-bucket + floor cut when configured);
+// everything it rejects is flagged send-max-filtered so the existing
+// withdraw-time backfill and ListPath reporting stay consistent.
 func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey) []*table.Path {
-	sendMax := int(peer.getAddPathSendMax(family))
-	// SendMax == 0 means "no cap" everywhere else (the initial-dump slot
-	// logic, evalExportDumpDest); ADD-PATH send is only negotiated with
-	// SendMax > 0 today, but if that ever changes this must not read as
-	// "withdraw everything".
-	if sendMax <= 0 {
-		sendMax = math.MaxInt
-	}
+	sel := newExportSelector(peer.exportSelection(family))
 
 	result := []*table.Path{}
-	slots := 0
 	for _, p := range known {
 		fp := s.filterpath(peer, p, nil)
 		if fp == nil {
 			continue
 		}
-		if slots < sendMax {
-			slots++
+		// Selection runs on the Loc-RIB path p (the attributes ranking
+		// saw), not the post-policy rewrite fp.
+		if sel.admit(p) {
 			peer.unsetPathSendMaxFiltered(fp)
 			// re-announce the changed path itself; announce newly promoted paths
 			if reannounceKey != nil && fp.GetLocalKey() == *reannounceKey || !peer.hasPathAlreadyBeenSent(fp) {
@@ -1167,25 +1164,34 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 	}
 
 	for _, family := range peer.toGlobalFamilies(rfList) {
-		// Bendrr (D-034 / Spike 1 gate 2): cap the initial ADD-PATH dump at
-		// SendMax per destination. getPossibleBest returns paths in
+		// Bendrr (D-034 / Spike 1 gate 2, R-037): cut the initial ADD-PATH
+		// dump per destination with the export selector (flat SendMax or
+		// best-bucket + floor). getPossibleBest returns paths in
 		// per-destination best-path ranked order (D-014 comparator chain),
-		// so the first SendMax paths of each destination are the ranked
-		// export set; the rest are flagged for withdraw-time backfill.
-		sendMax := 0
+		// so per-destination selectors see candidates in ranked order;
+		// rejected paths are flagged for withdraw-time backfill.
+		var selParams exportSelection
 		if peer.isAddPathSendEnabled(family) {
-			sendMax = int(peer.getAddPathSendMax(family))
+			selParams = peer.exportSelection(family)
 		}
-		slots := make(map[table.PathDestLocalKey]int)
+		var sels map[table.PathDestLocalKey]*exportSelector
+		if selParams.active() {
+			sels = make(map[table.PathDestLocalKey]*exportSelector)
+		}
 		for _, path := range s.getPossibleBest(peer, family) {
 			if p := s.filterpath(peer, path, nil); p != nil {
-				if sendMax > 0 {
+				if sels != nil {
 					k := p.GetDestLocalKey()
-					if slots[k] >= sendMax {
+					sel, ok := sels[k]
+					if !ok {
+						fresh := newExportSelector(selParams)
+						sel = &fresh
+						sels[k] = sel
+					}
+					if !sel.admit(path) {
 						peer.setPathSendMaxFiltered(p)
 						continue
 					}
-					slots[k]++
 					peer.unsetPathSendMaxFiltered(p)
 				}
 				pathList = append(pathList, p)
@@ -1645,6 +1651,14 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 					alreadySent := targetPeer.hasPathAlreadyBeenSent(newPath)
 					newPath := s.filterpath(targetPeer, newPath, nil)
 					// if the path is not filtered and the path has already been sent or land in the limit, we can send it
+					// R-037 exemption: this RTC branch keeps the flat
+					// SendMax count cut and does NOT go through
+					// exportSelector — route-target membership routes are
+					// bookkeeping, not diversity-managed data paths, and
+					// Bendrr sets no bucket knobs on RTC families. Note
+					// the cut here is NOT equivalent to the bucket cut
+					// (bucket ties also key on AS_PATH length etc.); this
+					// is a deliberate scope exclusion, not an equivalence.
 					if newPath == nil {
 						bestList = []*table.Path{}
 					} else if alreadySent || targetPeer.getRoutesCount(f, newPath.GetPrefix()) < targetPeer.getAddPathSendMax(f) {
@@ -3683,6 +3697,18 @@ func (s *BgpServer) addPeerGroup(c *oc.PeerGroup) error {
 		return fmt.Errorf("can't overwrite the existing peer-group: %s", name)
 	}
 
+	// Members validate their effective config on add, but a group can sit
+	// memberless; reject unusable R-037 bucket knobs at definition time.
+	if err := c.AddPaths.Config.ValidateExportSelection(); err != nil {
+		return fmt.Errorf("peer-group %s: %w", name, err)
+	}
+	for i := range c.AfiSafis {
+		if err := c.AfiSafis[i].AddPaths.Config.ValidateExportSelection(); err != nil {
+			return fmt.Errorf("peer-group %s afi-safi %s: %w",
+				name, c.AfiSafis[i].Config.AfiSafiName, err)
+		}
+	}
+
 	s.logger.Info("Add a peer group configuration",
 		slog.String("Topic", "Peer"),
 		slog.String("Name", name))
@@ -4156,10 +4182,49 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 		conf.Timers.Config = c.Timers.Config
 	}
 
+	// Bendrr R-037: the bucket-aware export knobs are excluded from
+	// EqualNegotiated, so a knob-only change reaches this non-bounce path.
+	// Detect the change here (read-only: the effective per-AFI-SAFI values
+	// land via updatePrefixLimitConfig below, which replaces conf.AfiSafis
+	// with c.AfiSafis wholesale) and re-sync the peer's export set with a
+	// non-deferral soft reset out: the async dump announces the new cut
+	// and withdraws previously sent paths the new selection rejects.
+	exportKnobsChanged := original.AddPaths.Config.LowestIgpMax != c.AddPaths.Config.LowestIgpMax ||
+		original.AddPaths.Config.MinPaths != c.AddPaths.Config.MinPaths
+	if !exportKnobsChanged {
+		for i := range conf.AfiSafis {
+			nc := c.GetAfiSafi(conf.AfiSafis[i].State.Family)
+			if nc == nil {
+				continue
+			}
+			ac := &conf.AfiSafis[i].AddPaths.Config
+			if ac.LowestIgpMax != nc.AddPaths.Config.LowestIgpMax ||
+				ac.MinPaths != nc.AddPaths.Config.MinPaths {
+				exportKnobsChanged = true
+				break
+			}
+		}
+	}
+	// Keep the neighbor-level copy in sync so later Equal-based diffs see
+	// the applied values (per-AFI-SAFI copies are replaced below).
+	conf.AddPaths.Config.LowestIgpMax = c.AddPaths.Config.LowestIgpMax
+	conf.AddPaths.Config.MinPaths = c.AddPaths.Config.MinPaths
+	if exportKnobsChanged {
+		peer.fsm.logger.Info("Update ADD-PATH export selection knobs without session bounce",
+			slog.Uint64("LowestIgpMax", uint64(c.AddPaths.Config.LowestIgpMax)),
+			slog.Uint64("MinPaths", uint64(c.AddPaths.Config.MinPaths)))
+	}
+
 	isLimit, err := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
 	if err == nil {
 		peer.fsm.pConf.Update(&conf)
 		peer.fsm.lock.Unlock()
+		if exportKnobsChanged {
+			if rerr := s.softResetOut(addr, bgp.Family(0), false); rerr != nil {
+				peer.fsm.logger.Warn("Failed to re-sync export after ADD-PATH knob change",
+					slog.String("Err", rerr.Error()))
+			}
+		}
 		if bfdConfigChanged {
 			err = s.updateBfdPeer(
 				addr,
