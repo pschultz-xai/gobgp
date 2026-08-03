@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/netip"
 	"slices"
@@ -1093,26 +1092,24 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 // re-announcing the path with that local key even when it has already been
 // sent (used when that path's attributes just changed); the D-066 metric-map
 // re-rank passes nil because no path content changed — only rank order — so
-// already-advertised paths that stay inside the SendMax cut cost nothing.
+// already-advertised paths that stay inside the selection cut cost nothing.
+//
+// Which survivors are exported is the exportSelector's decision (flat
+// top-SendMax, or the R-037 best-bucket + floor cut when configured);
+// everything it rejects is flagged send-max-filtered so the existing
+// withdraw-time backfill and ListPath reporting stay consistent.
 func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey) []*table.Path {
-	sendMax := int(peer.getAddPathSendMax(family))
-	// SendMax == 0 means "no cap" everywhere else (the initial-dump slot
-	// logic, evalExportDumpDest); ADD-PATH send is only negotiated with
-	// SendMax > 0 today, but if that ever changes this must not read as
-	// "withdraw everything".
-	if sendMax <= 0 {
-		sendMax = math.MaxInt
-	}
+	sel := newExportSelector(peer.exportSelection(family))
 
 	result := []*table.Path{}
-	slots := 0
 	for _, p := range known {
 		fp := s.filterpath(peer, p, nil)
 		if fp == nil {
 			continue
 		}
-		if slots < sendMax {
-			slots++
+		// Selection runs on the Loc-RIB path p (the attributes ranking
+		// saw), not the post-policy rewrite fp.
+		if sel.admit(p) {
 			peer.unsetPathSendMaxFiltered(fp)
 			// re-announce the changed path itself; announce newly promoted paths
 			if reannounceKey != nil && fp.GetLocalKey() == *reannounceKey || !peer.hasPathAlreadyBeenSent(fp) {
@@ -1168,25 +1165,34 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 	}
 
 	for _, family := range peer.toGlobalFamilies(rfList) {
-		// Bendrr (D-034 / Spike 1 gate 2): cap the initial ADD-PATH dump at
-		// SendMax per destination. getPossibleBest returns paths in
+		// Bendrr (D-034 / Spike 1 gate 2, R-037): cut the initial ADD-PATH
+		// dump per destination with the export selector (flat SendMax or
+		// best-bucket + floor). getPossibleBest returns paths in
 		// per-destination best-path ranked order (D-014 comparator chain),
-		// so the first SendMax paths of each destination are the ranked
-		// export set; the rest are flagged for withdraw-time backfill.
-		sendMax := 0
+		// so per-destination selectors see candidates in ranked order;
+		// rejected paths are flagged for withdraw-time backfill.
+		var selParams exportSelection
 		if peer.isAddPathSendEnabled(family) {
-			sendMax = int(peer.getAddPathSendMax(family))
+			selParams = peer.exportSelection(family)
 		}
-		slots := make(map[table.PathDestLocalKey]int)
+		var sels map[table.PathDestLocalKey]*exportSelector
+		if selParams.active() {
+			sels = make(map[table.PathDestLocalKey]*exportSelector)
+		}
 		for _, path := range s.getPossibleBest(peer, family) {
 			if p := s.filterpath(peer, path, nil); p != nil {
-				if sendMax > 0 {
+				if sels != nil {
 					k := p.GetDestLocalKey()
-					if slots[k] >= sendMax {
+					sel, ok := sels[k]
+					if !ok {
+						fresh := newExportSelector(selParams)
+						sel = &fresh
+						sels[k] = sel
+					}
+					if !sel.admit(path) {
 						peer.setPathSendMaxFiltered(p)
 						continue
 					}
-					slots[k]++
 					peer.unsetPathSendMaxFiltered(p)
 				}
 				pathList = append(pathList, p)

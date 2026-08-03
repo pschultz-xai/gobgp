@@ -303,9 +303,9 @@ type exportDumpDest struct {
 }
 
 type exportDumpFamily struct {
-	family  bgp.Family // global-space family whose table was walked
-	sendMax int        // >0 only for ADD-PATH send peers with a SendMax cap
-	dests   []exportDumpDest
+	family bgp.Family      // global-space family whose table was walked
+	sel    exportSelection // active only for ADD-PATH send peers with a selection cut
+	dests  []exportDumpDest
 }
 
 // snapshotExportDump captures the peer-visible candidate paths per family as
@@ -323,7 +323,7 @@ func (s *BgpServer) snapshotExportDump(peer *peer, families []bgp.Family) []*exp
 		fam := &exportDumpFamily{family: family}
 		addPath := peer.isAddPathSendEnabled(family)
 		if addPath {
-			fam.sendMax = int(peer.getAddPathSendMax(family))
+			fam.sel = peer.exportSelection(family)
 		}
 		for _, dst := range tbl.GetDestinations() {
 			var candidates []*table.Path
@@ -366,7 +366,7 @@ type exportDumpChunkEntry struct {
 func (s *BgpServer) evalExportDumpDest(peer *peer, fam *exportDumpFamily, dd exportDumpDest, o exportDumpOpts) (exportDumpChunkEntry, bool) {
 	var e exportDumpChunkEntry
 	haveKey := false
-	slots := 0
+	sel := newExportSelector(fam.sel)
 	var announce []*table.Path
 	for _, path := range dd.candidates {
 		fp := s.filterpath(peer, path, nil)
@@ -388,12 +388,13 @@ func (s *BgpServer) evalExportDumpDest(peer *peer, fam *exportDumpFamily, dd exp
 			e.key = fp.GetDestLocalKey()
 			haveKey = true
 		}
-		if fam.sendMax > 0 {
-			if slots >= fam.sendMax {
+		if fam.sel.active() {
+			// Selection runs on the snapshot Loc-RIB path (the attributes
+			// ranking saw), not the post-policy rewrite fp.
+			if !sel.admit(path) {
 				e.setMaxFiltered = append(e.setMaxFiltered, fp)
 				continue
 			}
-			slots++
 			e.unsetMaxFiltered = append(e.unsetMaxFiltered, fp)
 		}
 		if o.dropWithdraws && fp.IsWithdraw {

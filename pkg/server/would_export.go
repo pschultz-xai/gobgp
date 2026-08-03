@@ -81,7 +81,7 @@ func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn fu
 		peer        *peer
 		dests       []wouldDest
 		addPathSend bool
-		sendMax     int
+		selParams   exportSelection
 		validate    func(*table.Path) *table.Validation
 	)
 
@@ -121,10 +121,12 @@ func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn fu
 			})
 		}
 		addPathSend = p.isAddPathSendEnabled(r.Family)
-		// ADD-PATH send peers get the ranked SendMax set (0 = unlimited,
-		// matching upstream semantics).
+		// ADD-PATH send peers get the ranked selection cut — flat SendMax
+		// (0 = unlimited, matching upstream semantics) or the R-037
+		// best-bucket + floor when configured — identical to the live
+		// export path.
 		if addPathSend {
-			sendMax = int(p.getAddPathSendMax(r.Family))
+			selParams = p.exportSelection(r.Family)
 		}
 
 		// The ROA table carries its own lock (Bendrr R-212), so Validate
@@ -156,8 +158,9 @@ func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn fu
 			// if policy rejects it, the runner-up is not substituted.
 			candidates = candidates[:1]
 		}
+		sel := newExportSelector(selParams)
 		for _, path := range candidates {
-			if sendMax > 0 && len(out) >= sendMax {
+			if sel.exhausted() {
 				break
 			}
 			p, options, stop := s.prePolicyFilterpath(peer, path, nil)
@@ -170,6 +173,12 @@ func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn fu
 				return err
 			}
 			if p = s.postFilterpath(peer, p); p == nil {
+				continue
+			}
+			// Selection runs on the snapshot Loc-RIB path (the attributes
+			// ranking saw), after the policy verdict — matching the live
+			// export order: only policy survivors consume selection slots.
+			if !sel.admit(path) {
 				continue
 			}
 			out = append(out, toPathApiUtil(p))

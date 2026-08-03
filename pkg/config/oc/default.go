@@ -171,6 +171,8 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 			n.AfiSafis[i].AddPaths.State.Receive = n.AddPaths.Config.Receive
 			n.AfiSafis[i].AddPaths.Config.SendMax = n.AddPaths.Config.SendMax
 			n.AfiSafis[i].AddPaths.State.SendMax = n.AddPaths.Config.SendMax
+			n.AfiSafis[i].AddPaths.Config.LowestIgpMax = n.AddPaths.Config.LowestIgpMax
+			n.AfiSafis[i].AddPaths.Config.MinPaths = n.AddPaths.Config.MinPaths
 		}
 	} else {
 		afs, err := extractArray(v.Get("neighbor.afi-safis"))
@@ -204,6 +206,16 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 				}
 			}
 			n.AfiSafis[i].AddPaths.State.SendMax = n.AfiSafis[i].AddPaths.Config.SendMax
+			if !vv.IsSet("afi-safi.add-paths.config.lowest-igp-max") {
+				if n.AddPaths.Config.LowestIgpMax != 0 {
+					n.AfiSafis[i].AddPaths.Config.LowestIgpMax = n.AddPaths.Config.LowestIgpMax
+				}
+			}
+			if !vv.IsSet("afi-safi.add-paths.config.min-paths") {
+				if n.AddPaths.Config.MinPaths != 0 {
+					n.AfiSafis[i].AddPaths.Config.MinPaths = n.AddPaths.Config.MinPaths
+				}
+			}
 		}
 	}
 

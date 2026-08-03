@@ -10351,9 +10351,16 @@ func (x *AfiSafi) GetAddPaths() *AddPaths {
 }
 
 type AddPathsConfig struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Receive       bool                   `protobuf:"varint,1,opt,name=receive,proto3" json:"receive,omitempty"`
-	SendMax       uint32                 `protobuf:"varint,2,opt,name=send_max,json=sendMax,proto3" json:"send_max,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Receive bool                   `protobuf:"varint,1,opt,name=receive,proto3" json:"receive,omitempty"`
+	SendMax uint32                 `protobuf:"varint,2,opt,name=send_max,json=sendMax,proto3" json:"send_max,omitempty"`
+	// Bendrr R-037 bucket-aware export selection: when lowest_igp_max > 0 the
+	// exported ADD-PATH set is up to lowest_igp_max paths tying with the best
+	// path through the location-metric comparator slot, padded to min_paths
+	// with next-ranked paths when the bucket is thin; send_max stays the
+	// absolute ceiling. Zero means flat top-send_max (upstream behavior).
+	LowestIgpMax  uint32 `protobuf:"varint,3,opt,name=lowest_igp_max,json=lowestIgpMax,proto3" json:"lowest_igp_max,omitempty"`
+	MinPaths      uint32 `protobuf:"varint,4,opt,name=min_paths,json=minPaths,proto3" json:"min_paths,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10398,6 +10405,20 @@ func (x *AddPathsConfig) GetReceive() bool {
 func (x *AddPathsConfig) GetSendMax() uint32 {
 	if x != nil {
 		return x.SendMax
+	}
+	return 0
+}
+
+func (x *AddPathsConfig) GetLowestIgpMax() uint32 {
+	if x != nil {
+		return x.LowestIgpMax
+	}
+	return 0
+}
+
+func (x *AddPathsConfig) GetMinPaths() uint32 {
+	if x != nil {
+		return x.MinPaths
 	}
 	return 0
 }
@@ -14461,10 +14482,12 @@ const file_api_gobgp_proto_rawDesc = "" +
 	"\x17route_target_membership\x18\b \x01(\v2\x1a.api.RouteTargetMembershipR\x15routeTargetMembership\x12\\\n" +
 	"\x1blong_lived_graceful_restart\x18\t \x01(\v2\x1d.api.LongLivedGracefulRestartR\x18longLivedGracefulRestart\x12*\n" +
 	"\tadd_paths\x18\n" +
-	" \x01(\v2\r.api.AddPathsR\baddPaths\"E\n" +
+	" \x01(\v2\r.api.AddPathsR\baddPaths\"\x88\x01\n" +
 	"\x0eAddPathsConfig\x12\x18\n" +
 	"\areceive\x18\x01 \x01(\bR\areceive\x12\x19\n" +
-	"\bsend_max\x18\x02 \x01(\rR\asendMax\"D\n" +
+	"\bsend_max\x18\x02 \x01(\rR\asendMax\x12$\n" +
+	"\x0elowest_igp_max\x18\x03 \x01(\rR\flowestIgpMax\x12\x1b\n" +
+	"\tmin_paths\x18\x04 \x01(\rR\bminPaths\"D\n" +
 	"\rAddPathsState\x12\x18\n" +
 	"\areceive\x18\x01 \x01(\bR\areceive\x12\x19\n" +
 	"\bsend_max\x18\x02 \x01(\rR\asendMax\"a\n" +

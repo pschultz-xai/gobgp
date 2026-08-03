@@ -1063,6 +1063,8 @@ func readAddPathsFromAPIStruct(c *oc.AddPaths, a *api.AddPaths) {
 	if a.Config != nil {
 		c.Config.Receive = a.Config.Receive
 		c.Config.SendMax = uint8(a.Config.SendMax)
+		c.Config.LowestIgpMax = uint8(a.Config.LowestIgpMax)
+		c.Config.MinPaths = uint8(a.Config.MinPaths)
 	}
 }
 

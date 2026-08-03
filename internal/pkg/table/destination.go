@@ -446,6 +446,10 @@ func (dest *destination) implicitWithdraw(logger *slog.Logger, newPath *Path) *P
 //	router ID.
 //
 //	Assumes paths from NC has source equal to None.
+//
+// LOCKSTEP (Bendrr R-037): the step order up to and including
+// compareByLocationMetric is mirrored by EqualThroughLocationMetric below;
+// changes to that prefix of the chain must be applied to both.
 func rankBetterPath(path1, path2 *Path) *Path {
 	if b := compareByLLGRStaleCommunity(path1, path2); b != nil {
 		return b
@@ -484,6 +488,52 @@ func rankBetterPath(path1, path2 *Path) *Path {
 		return b
 	}
 	return nil
+}
+
+// EqualThroughLocationMetric reports whether two paths tie at every
+// comparator step of rankBetterPath up to and including the D-014
+// location-metric slot — i.e. whether they belong to the same "best bucket"
+// for bucket-aware ADD-PATH export selection (Bendrr R-037). Paths that are
+// equal-through-metric differ only by the pure determinism tie-breaks below
+// the metric slot (age, router ID, neighbor address), which carry no
+// operational preference.
+//
+// The step list MUST stay in lockstep with rankBetterPath; a step added to
+// or moved in the ranking chain relative to the location-metric slot changes
+// bucket membership and must be mirrored here. Note that compareByMED's
+// comparability rules make this relation non-transitive in general (two
+// paths from different neighbor AS "tie" on MED without being equal), so
+// callers must not assume equal-through-metric paths form a contiguous
+// prefix of a ranked list — test each candidate against the bucket anchor.
+func EqualThroughLocationMetric(path1, path2 *Path) bool {
+	if b := compareByLLGRStaleCommunity(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByReachableNexthop(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByLocalPref(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByLocalOrigin(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByASPath(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByOrigin(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByMED(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByASNumber(path1, path2); b != nil {
+		return false
+	}
+	if b := compareByLocationMetric(path1, path2); b != nil {
+		return false
+	}
+	return true
 }
 
 func (dest *destination) insertSort(newPath *Path) {

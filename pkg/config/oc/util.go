@@ -365,8 +365,10 @@ func newLongLivedGracefulRestartFromConfigStruct(c *LongLivedGracefulRestart) *a
 func newAddPathsFromConfigStruct(c *AddPaths) *api.AddPaths {
 	return &api.AddPaths{
 		Config: &api.AddPathsConfig{
-			Receive: c.Config.Receive,
-			SendMax: uint32(c.Config.SendMax),
+			Receive:      c.Config.Receive,
+			SendMax:      uint32(c.Config.SendMax),
+			LowestIgpMax: uint32(c.Config.LowestIgpMax),
+			MinPaths:     uint32(c.Config.MinPaths),
 		},
 	}
 }
@@ -666,6 +668,8 @@ func NewPeerGroupFromConfigStruct(pconf *PeerGroup) *api.PeerGroup {
 		if afiSafi := newAfiSafiFromConfigStruct(&f); afiSafi != nil {
 			afiSafi.AddPaths.Config.Receive = pconf.AddPaths.Config.Receive
 			afiSafi.AddPaths.Config.SendMax = uint32(pconf.AddPaths.Config.SendMax)
+			afiSafi.AddPaths.Config.LowestIgpMax = uint32(pconf.AddPaths.Config.LowestIgpMax)
+			afiSafi.AddPaths.Config.MinPaths = uint32(pconf.AddPaths.Config.MinPaths)
 			afiSafis = append(afiSafis, afiSafi)
 		}
 	}
