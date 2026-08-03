@@ -85,27 +85,45 @@ func (t *LocationMetricTable) Equal(o *LocationMetricTable) bool {
 		maps.Equal(t.Destinations, o.Destinations)
 }
 
+// MetricForPath returns the path's metric and counts missing lookups —
+// the D-014 alerting signal for RIB content the map cannot rank. Use it on
+// the ranking path (compareByLocationMetric) only; bookkeeping reads that
+// scale with export volume or reload walks must use MetricForPathQuiet so
+// the counter keeps meaning "paths in the RIB the map doesn't know".
 func (t *LocationMetricTable) MetricForPath(path *Path) uint32 {
+	m, missing := t.metricForPath(path)
+	if missing {
+		t.missingLookups.Add(1)
+	}
+	return m
+}
+
+// MetricForPathQuiet is MetricForPath without the missing-lookup counter
+// bump (bucket-equivalence checks, reload partition bookkeeping).
+func (t *LocationMetricTable) MetricForPathQuiet(path *Path) uint32 {
+	m, _ := t.metricForPath(path)
+	return m
+}
+
+func (t *LocationMetricTable) metricForPath(path *Path) (metric uint32, missing bool) {
 	if !t.Enabled() {
-		return 0
+		return 0, false
 	}
 
 	locID, ok := locationIDFromPath(path, t.GlobalAdmin)
 	if !ok {
-		t.missingLookups.Add(1)
-		return LocationMetricMissingSentinel
+		return LocationMetricMissingSentinel, true
 	}
 
 	if locID == t.PerspectiveLocationID {
-		return 0
+		return 0, false
 	}
 
 	if metric, ok := t.Destinations[locID]; ok {
-		return metric
+		return metric, false
 	}
 
-	t.missingLookups.Add(1)
-	return LocationMetricMissingSentinel
+	return LocationMetricMissingSentinel, true
 }
 
 func locationIDFromPath(path *Path, globalAdmin uint32) (uint32, bool) {

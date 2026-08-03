@@ -2562,6 +2562,19 @@ type AddPathsConfig struct {
 	// The maximum number of paths to advertise to neighbors
 	// for a single NLRI.
 	SendMax uint8 `mapstructure:"send-max" json:"send-max,omitempty"`
+	// Bendrr R-037 bucket-aware export selection. When non-zero, the
+	// ADD-PATH export set for a destination is not the flat top-SendMax of
+	// ranked order but: up to lowest-igp-max paths that tie with the best
+	// path through the location-metric comparator slot (the "best bucket"),
+	// padded with next-ranked paths up to min-paths when the bucket is
+	// thin. SendMax remains the absolute ceiling. Zero disables bucketing
+	// (flat top-SendMax, upstream-compatible).
+	LowestIgpMax uint8 `mapstructure:"lowest-igp-max" json:"lowest-igp-max,omitempty"`
+	// Floor for bucket-aware selection: when the best bucket exports fewer
+	// than min-paths paths, next-ranked paths outside the bucket fill up to
+	// this count (pre-programmed backups). Meaningful only with
+	// lowest-igp-max > 0.
+	MinPaths uint8 `mapstructure:"min-paths" json:"min-paths,omitempty"`
 }
 
 func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
@@ -2572,6 +2585,12 @@ func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
 		return false
 	}
 	if lhs.SendMax != rhs.SendMax {
+		return false
+	}
+	if lhs.LowestIgpMax != rhs.LowestIgpMax {
+		return false
+	}
+	if lhs.MinPaths != rhs.MinPaths {
 		return false
 	}
 	return true

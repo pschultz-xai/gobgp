@@ -1130,6 +1130,13 @@ message AfiSafi {
 message AddPathsConfig {
   bool receive = 1;
   uint32 send_max = 2;
+  // Bendrr R-037 bucket-aware export selection: when lowest_igp_max > 0 the
+  // exported ADD-PATH set is up to lowest_igp_max paths tying with the best
+  // path through the location-metric comparator slot, padded to min_paths
+  // with next-ranked paths when the bucket is thin; send_max stays the
+  // absolute ceiling. Zero means flat top-send_max (upstream behavior).
+  uint32 lowest_igp_max = 3;
+  uint32 min_paths = 4;
 }
 
 message AddPathsState {

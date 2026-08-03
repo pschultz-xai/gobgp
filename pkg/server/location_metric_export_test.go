@@ -60,6 +60,14 @@ func mountLocationMetricTable(t *testing.T, destinations map[uint32]uint32) {
 // pod-side server (e.g. GrpcListenAddress for gRPC-level tests).
 func startLocationMetricPair(t *testing.T, sendMax uint8, podOpts ...ServerOption) (pod *BgpServer, router *BgpServer) {
 	t.Helper()
+	return startAddPathsExportPair(t, oc.AddPathsConfig{SendMax: sendMax}, podOpts...)
+}
+
+// startAddPathsExportPair is startLocationMetricPair with the full ADD-PATH
+// export selection config on the pod-side neighbor (R-037 bucket knobs
+// alongside SendMax).
+func startAddPathsExportPair(t *testing.T, addPaths oc.AddPathsConfig, podOpts ...ServerOption) (pod *BgpServer, router *BgpServer) {
+	t.Helper()
 
 	const asn = 65001
 	const listenPort = 10179
@@ -88,8 +96,9 @@ func startLocationMetricPair(t *testing.T, sendMax uint8, podOpts ...ServerOptio
 	require.NoError(t, err)
 	t.Cleanup(router.Stop)
 
-	// Pod side: passive iBGP neighbor with ADD-PATH send capped at sendMax
-	// (the peer-group SendMax compiled from edge_export.add_path_max).
+	// Pod side: passive iBGP neighbor with the ADD-PATH export selection
+	// config (peer-group SendMax compiled from edge_export.add_path_max,
+	// plus the R-037 bucket knobs when set).
 	podNeighbor := &oc.Neighbor{
 		Config: oc.NeighborConfig{
 			NeighborAddress: netip.MustParseAddr("127.0.0.1"),
@@ -107,9 +116,7 @@ func startLocationMetricPair(t *testing.T, sendMax uint8, podOpts ...ServerOptio
 					Enabled:     true,
 				},
 				AddPaths: oc.AddPaths{
-					Config: oc.AddPathsConfig{
-						SendMax: sendMax,
-					},
+					Config: addPaths,
 				},
 			},
 		},

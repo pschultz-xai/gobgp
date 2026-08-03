@@ -127,6 +127,28 @@ func TestNeighAddrTieBreak(t *testing.T) {
 	assert.Equal(t, compareByNeighborAddress(p0, p1), p0)
 }
 
+// R-037 round-2: two locally injected paths (source address invalid on both
+// sides) that tie on every attribute must compare as a genuine tie in BOTH
+// argument orders. The historical first-argument-wins fallback made
+// rankBetterPath an invalid ordering for exactly the paths PSA injects, so
+// sort.SliceStable could permute fully-tied local paths on every D-066
+// metric reload and churn bucket-mode exports for no input change.
+func TestNeighAddrLocalPathsTieSymmetrically(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+
+	// Local iBGP-class sources: same AS/LocalAS/ID, no valid address —
+	// the shape the server stamps on API-injected candidates.
+	src1 := &PeerInfo{AS: 65001, LocalAS: 65001, ID: netip.MustParseAddr("1.1.1.1")}
+	src2 := &PeerInfo{AS: 65001, LocalAS: 65001, ID: netip.MustParseAddr("1.1.1.1")}
+	p0 := pathWithLocationLC(src1, nlri, 1, 102)
+	p1 := pathWithLocationLC(src2, nlri, 2, 102)
+
+	assert.Nil(t, compareByNeighborAddress(p0, p1))
+	assert.Nil(t, compareByNeighborAddress(p1, p0))
+	assert.Nil(t, rankBetterPath(p0, p1), "fully tied local paths must not be ordered")
+	assert.Nil(t, rankBetterPath(p1, p0))
+}
+
 func TestMedTieBreaker(t *testing.T) {
 	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
 

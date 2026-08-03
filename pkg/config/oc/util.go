@@ -202,6 +202,49 @@ func existPeerGroup(n string, b []PeerGroup) int {
 	return -1
 }
 
+// EqualNegotiated reports whether two ADD-PATH configs agree on the fields
+// whose change requires re-establishing the session: the capability
+// direction and the flat SendMax cap (SendMax is not in the OPEN, but a
+// SendMax change has always bounced the session here and D-034 kept that).
+// The Bendrr R-037 bucket knobs (LowestIgpMax, MinPaths) are deliberately
+// NOT part of this comparison: they alter only local export selection, so a
+// knob-only change is applied in place by updateNeighbor (with a soft reset
+// out) instead of bouncing the session. Full structural equality (Equal)
+// still includes them, so generic config change detection — Neighbor.Equal
+// on file reload in particular — sees knob-only edits.
+func (lhs *AddPathsConfig) EqualNegotiated(rhs *AddPathsConfig) bool {
+	if lhs == nil || rhs == nil {
+		return false
+	}
+	return lhs.Receive == rhs.Receive && lhs.SendMax == rhs.SendMax
+}
+
+// ValidateExportSelection rejects unusable R-037 bucket-knob combinations
+// at the config boundary, whatever the delivery surface (TOML file, gRPC
+// add/update, peer-group inheritance, hand-written static config). The
+// knobs are both-or-neither, require a SendMax ceiling, and must satisfy
+// 1 <= min-paths <= lowest-igp-max <= send-max; a violation would
+// otherwise be applied silently with selection behavior nobody specified
+// (round-2 review NEW-5). Zero on both knobs is the documented flat mode.
+func (c *AddPathsConfig) ValidateExportSelection() error {
+	if c.LowestIgpMax == 0 && c.MinPaths == 0 {
+		return nil
+	}
+	if c.LowestIgpMax == 0 || c.MinPaths == 0 {
+		return fmt.Errorf("add-paths lowest-igp-max and min-paths must be set together (lowest-igp-max=%d, min-paths=%d)", c.LowestIgpMax, c.MinPaths)
+	}
+	if c.SendMax == 0 {
+		return fmt.Errorf("add-paths lowest-igp-max/min-paths require send-max (the export ceiling) to be set")
+	}
+	if c.MinPaths > c.LowestIgpMax {
+		return fmt.Errorf("add-paths min-paths (%d) must not exceed lowest-igp-max (%d)", c.MinPaths, c.LowestIgpMax)
+	}
+	if c.LowestIgpMax > c.SendMax {
+		return fmt.Errorf("add-paths lowest-igp-max (%d) must not exceed send-max (%d)", c.LowestIgpMax, c.SendMax)
+	}
+	return nil
+}
+
 func isAfiSafiChanged(x, y []AfiSafi) bool {
 	if len(x) != len(y) {
 		return true
@@ -211,7 +254,7 @@ func isAfiSafiChanged(x, y []AfiSafi) bool {
 		m[string(e.Config.AfiSafiName)] = x[i]
 	}
 	for _, e := range y {
-		if v, ok := m[string(e.Config.AfiSafiName)]; !ok || !v.Config.Equal(&e.Config) || !v.AddPaths.Config.Equal(&e.AddPaths.Config) || !v.MpGracefulRestart.Config.Equal(&e.MpGracefulRestart.Config) {
+		if v, ok := m[string(e.Config.AfiSafiName)]; !ok || !v.Config.Equal(&e.Config) || !v.AddPaths.Config.EqualNegotiated(&e.AddPaths.Config) || !v.MpGracefulRestart.Config.Equal(&e.MpGracefulRestart.Config) {
 			return true
 		}
 	}
@@ -221,7 +264,7 @@ func isAfiSafiChanged(x, y []AfiSafi) bool {
 func (n *Neighbor) NeedsResendOpenMessage(new *Neighbor) bool {
 	return !n.Config.Equal(&new.Config) ||
 		!n.Transport.Config.Equal(&new.Transport.Config) ||
-		!n.AddPaths.Config.Equal(&new.AddPaths.Config) ||
+		!n.AddPaths.Config.EqualNegotiated(&new.AddPaths.Config) ||
 		!n.AsPathOptions.Config.Equal(&new.AsPathOptions.Config) ||
 		!n.GracefulRestart.Config.Equal(&new.GracefulRestart.Config) ||
 		isAfiSafiChanged(n.AfiSafis, new.AfiSafis) ||
@@ -395,8 +438,10 @@ func newLongLivedGracefulRestartFromConfigStruct(c *LongLivedGracefulRestart) *a
 func newAddPathsFromConfigStruct(c *AddPaths) *api.AddPaths {
 	return &api.AddPaths{
 		Config: &api.AddPathsConfig{
-			Receive: c.Config.Receive,
-			SendMax: uint32(c.Config.SendMax),
+			Receive:      c.Config.Receive,
+			SendMax:      uint32(c.Config.SendMax),
+			LowestIgpMax: uint32(c.Config.LowestIgpMax),
+			MinPaths:     uint32(c.Config.MinPaths),
 		},
 	}
 }
@@ -779,6 +824,8 @@ func NewPeerGroupFromConfigStruct(pconf *PeerGroup) *api.PeerGroup {
 		if afiSafi := newAfiSafiFromConfigStruct(&f); afiSafi != nil {
 			afiSafi.AddPaths.Config.Receive = pconf.AddPaths.Config.Receive
 			afiSafi.AddPaths.Config.SendMax = uint32(pconf.AddPaths.Config.SendMax)
+			afiSafi.AddPaths.Config.LowestIgpMax = uint32(pconf.AddPaths.Config.LowestIgpMax)
+			afiSafi.AddPaths.Config.MinPaths = uint32(pconf.AddPaths.Config.MinPaths)
 			afiSafis = append(afiSafis, afiSafi)
 		}
 	}
