@@ -1062,10 +1062,21 @@ func readAddPathsFromAPIStruct(c *oc.AddPaths, a *api.AddPaths) {
 	}
 	if a.Config != nil {
 		c.Config.Receive = a.Config.Receive
-		c.Config.SendMax = uint8(a.Config.SendMax)
-		c.Config.LowestIgpMax = uint8(a.Config.LowestIgpMax)
-		c.Config.MinPaths = uint8(a.Config.MinPaths)
+		// Saturate instead of truncating: the OC fields are uint8, and a
+		// wrapped conversion of e.g. 256 would silently become 0 — which
+		// means "uncapped" for send-max and "bucketing disabled" for
+		// lowest-igp-max, both far more dangerous than capping at 255.
+		c.Config.SendMax = saturateUint8(a.Config.SendMax)
+		c.Config.LowestIgpMax = saturateUint8(a.Config.LowestIgpMax)
+		c.Config.MinPaths = saturateUint8(a.Config.MinPaths)
 	}
+}
+
+func saturateUint8(v uint32) uint8 {
+	if v > math.MaxUint8 {
+		return math.MaxUint8
+	}
+	return uint8(v)
 }
 
 func PeerTypeFromApi(a api.PeerType) (oc.PeerType, error) {

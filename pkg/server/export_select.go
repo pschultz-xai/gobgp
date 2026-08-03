@@ -71,14 +71,20 @@ func (peer *peer) exportSelection(family bgp.Family) exportSelection {
 //     D-034 behavior.
 //   - bucket mode (bucketMax > 0): survivors tying with the first survivor
 //     (the bucket anchor) through the location-metric comparator slot are
-//     admitted up to bucketMax; non-tying survivors are admitted only while
-//     the total is below minPaths (backup floor). sendMax stays the absolute
-//     ceiling.
+//     admitted up to bucketMax; all other survivors — non-tying, or tying
+//     after the bucket slots are spent — are admitted only while the total
+//     is below minPaths (backup floor). sendMax stays the absolute ceiling.
 //
 // Because compareByMED's comparability rules make the tie relation
 // non-transitive, bucket members are not guaranteed to be a contiguous
 // prefix of ranked order; each candidate is tested against the anchor
 // independently (see table.EqualThroughLocationMetric).
+//
+// Naming note: paths this selector rejects are flagged (and reported by
+// ListPath) as "send-max-filtered" even when SendMax itself has free slots
+// and the rejection came from the bucket cut — the flag name predates
+// bucket mode and is kept for API compatibility; read it as "suppressed by
+// export selection".
 //
 // The selector is single-destination, single-pass state; build a fresh one
 // per destination.
@@ -115,8 +121,19 @@ func newExportSelector(sel exportSelection) exportSelector {
 // order) joins the exported set. Callers must pass the Loc-RIB path (the
 // path ranking ran on), not the post-export-policy rewrite, so bucket
 // equivalence sees the attributes that produced the ranked order.
+//
+// The admitted count follows the documented formula
+// min(max(min(bucket, lowest_igp_max), min(min_paths, n)), send_max) for
+// every knob combination — including degenerate ones the bendrr lint
+// forbids (min_paths > lowest_igp_max): a bucket-tying candidate that finds
+// the bucket slots spent still counts against the floor, so the floor is
+// unconditional.
 func (s *exportSelector) admit(p *table.Path) bool {
-	if s.total >= s.sendMax {
+	if s.exhausted() {
+		// Cheap short-circuit before the comparator chain: once the bucket
+		// slots are spent and the floor is met (or sendMax is hit), no
+		// candidate can be admitted, and the equivalence check below costs
+		// a nine-step comparator walk per candidate on the serve loop.
 		return false
 	}
 	if !s.bucketed {
@@ -131,14 +148,13 @@ func (s *exportSelector) admit(p *table.Path) bool {
 		s.total++
 		return true
 	}
-	if table.EqualThroughLocationMetric(p, s.anchor) {
-		if s.bucket <= 0 {
-			return false
-		}
+	if table.EqualThroughLocationMetric(p, s.anchor) && s.bucket > 0 {
 		s.bucket--
 		s.total++
 		return true
 	}
+	// Floor fill: next-ranked candidates outside the bucket — or inside it
+	// once the bucket slots are spent — while the total is below minPaths.
 	if s.total < s.floor {
 		s.total++
 		return true

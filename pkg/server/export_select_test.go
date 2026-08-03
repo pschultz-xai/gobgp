@@ -131,9 +131,13 @@ func TestExportSelectorFloorFill(t *testing.T) {
 }
 
 func TestExportSelectorNonContiguousBucketMember(t *testing.T) {
-	// compareByMED comparability can interleave a non-bucket path between
-	// bucket members in ranked order; a later tying path must still get a
-	// bucket slot.
+	// admit must test each candidate against the anchor independently
+	// rather than assuming bucket members form a contiguous ranked prefix:
+	// a tying candidate arriving AFTER a non-tying one must still get a
+	// bucket slot. (These attribute-identical candidates would in reality
+	// rank contiguously; the genuinely non-contiguous ranked order that
+	// motivates this behavior — compareByMED's comparability rules — is
+	// pinned at the table level in TestEqualThroughLocationMetricMEDNonTransitive.)
 	mountLocationMetricTable(t, map[uint32]uint32{10: 100, 20: 100, 30: 200})
 
 	sel := newExportSelector(exportSelection{sendMax: 4, bucketMax: 4, minPaths: 2})
@@ -143,6 +147,26 @@ func TestExportSelectorNonContiguousBucketMember(t *testing.T) {
 		selTestPath(t, 3, 20), // ties with anchor — bucket member
 	}
 	assert.Equal(t, []bool{true, true, true}, admitAll(&sel, paths))
+}
+
+func TestExportSelectorDegenerateFloorAboveBucketCap(t *testing.T) {
+	// minPaths > bucketMax is forbidden by the bendrr lint but must still
+	// follow the documented formula
+	// min(max(min(bucket, bucketMax), min(minPaths, n)), sendMax):
+	// bucket-tying candidates beyond the bucket cap keep filling the floor.
+	// Five same-bucket candidates, bucketMax 2, minPaths 3 => 3 admitted.
+	mountLocationMetricTable(t, map[uint32]uint32{10: 100, 20: 100, 30: 100, 40: 100, 50: 100})
+
+	sel := newExportSelector(exportSelection{sendMax: 8, bucketMax: 2, minPaths: 3})
+	paths := []*table.Path{
+		selTestPath(t, 1, 10),
+		selTestPath(t, 2, 20),
+		selTestPath(t, 3, 30),
+		selTestPath(t, 4, 40),
+		selTestPath(t, 5, 50),
+	}
+	assert.Equal(t, []bool{true, true, true, false, false}, admitAll(&sel, paths))
+	assert.True(t, sel.exhausted())
 }
 
 func TestExportSelectorSendMaxCeiling(t *testing.T) {
@@ -160,10 +184,12 @@ func TestExportSelectorSendMaxCeiling(t *testing.T) {
 }
 
 func TestExportSelectorNoMetricTableOneBucket(t *testing.T) {
-	// Without a mounted metric map the comparator is disabled: identical
-	// candidates form one bucket and selection degrades to
-	// min(fan, bucketMax) — the compatibility property the rig relies on
-	// until it mounts a matrix.
+	// Without a mounted metric map the metric comparator is disabled, so
+	// ATTRIBUTE-IDENTICAL candidates (as here) form one bucket and
+	// selection degrades to min(fan, bucketMax). NOTE this is not a
+	// general flat-cut equivalence: candidates differing on any pre-metric
+	// step (AS_PATH length, MED within a comparable pair, ...) still split
+	// into separate buckets with no map mounted.
 	table.ResetLocationMetric()
 	t.Cleanup(table.ResetLocationMetric)
 

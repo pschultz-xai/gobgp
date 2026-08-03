@@ -60,6 +60,47 @@ func TestIsAfiSafiChanged(t *testing.T) {
 	assert.True(t, isAfiSafiChanged(old, new))
 }
 
+// R-037: a knob-only ADD-PATH change must be VISIBLE to generic config
+// change detection (Equal / Neighbor.Equal — this is what the file-reload
+// diff uses, so excluding the knobs there made a knob-only TOML reload a
+// silent no-op) while staying INVISIBLE to the session-bounce checks
+// (EqualNegotiated / NeedsResendOpenMessage / isAfiSafiChanged).
+func TestAddPathsBucketKnobsChangeDetection(t *testing.T) {
+	base := AddPathsConfig{Receive: true, SendMax: 4}
+	knobbed := AddPathsConfig{Receive: true, SendMax: 4, LowestIgpMax: 4, MinPaths: 2}
+
+	assert.False(t, base.Equal(&knobbed),
+		"structural equality must see the knob change or config reloads drop it")
+	assert.True(t, base.EqualNegotiated(&knobbed),
+		"knob-only changes must not require a session bounce")
+
+	moreSendMax := base
+	moreSendMax.SendMax = 8
+	assert.False(t, base.EqualNegotiated(&moreSendMax),
+		"SendMax keeps its historical bounce semantics")
+
+	mkNeighbor := func(ap AddPathsConfig) *Neighbor {
+		return &Neighbor{
+			Config: NeighborConfig{
+				NeighborAddress: netip.MustParseAddr("192.0.2.1"),
+				PeerAs:          65001,
+			},
+			AfiSafis: []AfiSafi{
+				{
+					Config:   AfiSafiConfig{AfiSafiName: AFI_SAFI_TYPE_IPV4_UNICAST},
+					AddPaths: AddPaths{Config: ap},
+				},
+			},
+		}
+	}
+	nBase, nKnobbed := mkNeighbor(base), mkNeighbor(knobbed)
+	assert.False(t, nBase.Equal(nKnobbed),
+		"Neighbor.Equal drives UpdateNeighborConfig's changed-list on file reload")
+	assert.False(t, nBase.NeedsResendOpenMessage(nKnobbed),
+		"knob-only changes take the in-place apply path, not the del/add bounce")
+	assert.False(t, isAfiSafiChanged(nBase.AfiSafis, nKnobbed.AfiSafis))
+}
+
 func newPeerFromConfigForBFDTest(t *testing.T, bfd Bfd) *api.Peer {
 	t.Helper()
 	n := &Neighbor{

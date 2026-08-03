@@ -447,33 +447,30 @@ func (dest *destination) implicitWithdraw(logger *slog.Logger, newPath *Path) *P
 //
 //	Assumes paths from NC has source equal to None.
 //
-// LOCKSTEP (Bendrr R-037): the step order up to and including
-// compareByLocationMetric is mirrored by EqualThroughLocationMetric below;
-// changes to that prefix of the chain must be applied to both.
+// LOCKSTEP (Bendrr R-037): the chain up to the location-metric slot is the
+// shared rankPreMetricComparators slice below, ranged by both this function
+// and EqualThroughLocationMetric, so the two cannot drift apart on those
+// steps. The location-metric slot itself is the one step the two apply
+// differently (ranking counts missing-metric lookups for the D-014 alerting
+// signal; equivalence uses quiet lookups) — a new comparator must go into
+// the shared slice if it belongs above the metric slot, or below the metric
+// call in this function only if it is a pure determinism tie-break.
+var rankPreMetricComparators = []func(*Path, *Path) *Path{
+	compareByLLGRStaleCommunity,
+	compareByReachableNexthop,
+	compareByLocalPref,
+	compareByLocalOrigin,
+	compareByASPath,
+	compareByOrigin,
+	compareByMED,
+	compareByASNumber,
+}
+
 func rankBetterPath(path1, path2 *Path) *Path {
-	if b := compareByLLGRStaleCommunity(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByReachableNexthop(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByLocalPref(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByLocalOrigin(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByASPath(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByOrigin(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByMED(path1, path2); b != nil {
-		return b
-	}
-	if b := compareByASNumber(path1, path2); b != nil {
-		return b
+	for _, cmp := range rankPreMetricComparators {
+		if b := cmp(path1, path2); b != nil {
+			return b
+		}
 	}
 	if b := compareByLocationMetric(path1, path2); b != nil {
 		return b
@@ -498,42 +495,27 @@ func rankBetterPath(path1, path2 *Path) *Path {
 // the metric slot (age, router ID, neighbor address), which carry no
 // operational preference.
 //
-// The step list MUST stay in lockstep with rankBetterPath; a step added to
-// or moved in the ranking chain relative to the location-metric slot changes
-// bucket membership and must be mirrored here. Note that compareByMED's
-// comparability rules make this relation non-transitive in general (two
-// paths from different neighbor AS "tie" on MED without being equal), so
-// callers must not assume equal-through-metric paths form a contiguous
-// prefix of a ranked list — test each candidate against the bucket anchor.
+// The pre-metric steps are the shared rankPreMetricComparators slice, so
+// they stay in lockstep with rankBetterPath structurally. The metric slot
+// uses quiet lookups (no missing-lookup counter bump): equivalence runs
+// per candidate per destination per peer on the export hot path, and
+// counting there would make the D-014 alerting signal track export volume
+// instead of RIB content. Note that compareByMED's comparability rules
+// make this relation non-transitive in general (two paths from different
+// neighbor AS "tie" on MED without being equal), so callers must not
+// assume equal-through-metric paths form a contiguous prefix of a ranked
+// list — test each candidate against the bucket anchor.
 func EqualThroughLocationMetric(path1, path2 *Path) bool {
-	if b := compareByLLGRStaleCommunity(path1, path2); b != nil {
-		return false
+	for _, cmp := range rankPreMetricComparators {
+		if cmp(path1, path2) != nil {
+			return false
+		}
 	}
-	if b := compareByReachableNexthop(path1, path2); b != nil {
-		return false
+	t := CurrentLocationMetric()
+	if !t.Enabled() {
+		return true
 	}
-	if b := compareByLocalPref(path1, path2); b != nil {
-		return false
-	}
-	if b := compareByLocalOrigin(path1, path2); b != nil {
-		return false
-	}
-	if b := compareByASPath(path1, path2); b != nil {
-		return false
-	}
-	if b := compareByOrigin(path1, path2); b != nil {
-		return false
-	}
-	if b := compareByMED(path1, path2); b != nil {
-		return false
-	}
-	if b := compareByASNumber(path1, path2); b != nil {
-		return false
-	}
-	if b := compareByLocationMetric(path1, path2); b != nil {
-		return false
-	}
-	return true
+	return t.MetricForPathQuiet(path1) == t.MetricForPathQuiet(path2)
 }
 
 func (dest *destination) insertSort(newPath *Path) {
@@ -549,17 +531,26 @@ func (dest *destination) insertSort(newPath *Path) {
 	dest.knownPathList = slices.Insert(dest.knownPathList, insertIdx, newPath)
 }
 
-// reSort fully re-sorts knownPathList under the current comparator chain and
-// reports whether the order changed. Needed when a global comparator input
-// changes out from under already-sorted lists — the D-066 location-metric
-// map reload — because insertSort relies on the sorted invariant for every
-// future incremental update. The sort is stable, so paths that tie keep
-// their current relative order and an unchanged comparator input yields no
-// reported change.
+// reSort fully re-sorts knownPathList under the current comparator chain
+// and reports whether the destination needs re-export. Needed when a global
+// comparator input changes out from under already-sorted lists — the D-066
+// location-metric map reload — because insertSort relies on the sorted
+// invariant for every future incremental update. The sort is stable, so
+// paths that tie keep their current relative order.
+//
+// "Needs re-export" is NOT just "the order moved": bucket-aware export
+// selection (Bendrr R-037) keys on metric VALUES via
+// EqualThroughLocationMetric, so a reload can change bucket membership —
+// and therefore the exported set — without moving the ranked order at all
+// (e.g. two tied locations diverging while their relative rank holds).
+// oldTbl is the table that was installed before the reload swap; when the
+// per-path metric partition differs between oldTbl and the currently
+// installed table, the destination is reported changed even if the order
+// held, so the reload re-runs export selection for it.
 //
 // INTERNAL USE ONLY: caller MUST hold the appropriate shard lock and must
 // NEVER call this on snapshot destinations.
-func (dest *destination) reSort() (*Update, bool) {
+func (dest *destination) reSort(oldTbl *LocationMetricTable) (*Update, bool) {
 	oldKnownPathList := make([]*Path, len(dest.knownPathList))
 	copy(oldKnownPathList, dest.knownPathList)
 
@@ -574,6 +565,9 @@ func (dest *destination) reSort() (*Update, bool) {
 			break
 		}
 	}
+	if !changed && metricPartitionChanged(oldTbl, CurrentLocationMetric(), dest.knownPathList) {
+		changed = true
+	}
 	if !changed {
 		return nil, false
 	}
@@ -584,6 +578,39 @@ func (dest *destination) reSort() (*Update, bool) {
 		KnownPathList:    l,
 		OldKnownPathList: oldKnownPathList,
 	}, true
+}
+
+// metricPartitionChanged reports whether swapping oldTbl for newTbl changes
+// the metric-equality partition of paths — i.e. whether any PAIR of paths
+// that tied on metric under one table does not tie under the other. That is
+// the only way a location-metric reload can change bucket membership
+// (EqualThroughLocationMetric's non-metric steps are table-independent), so
+// it is the exact extra re-export trigger reSort needs. Deliberately
+// conservative: it ignores whether a differing pair also ties on the
+// non-metric steps, so it can report true for destinations whose export set
+// is in fact unchanged — the re-export sync is idempotent and emits nothing
+// for those.
+func metricPartitionChanged(oldTbl, newTbl *LocationMetricTable, paths []*Path) bool {
+	if len(paths) < 2 || oldTbl.Equal(newTbl) {
+		return false
+	}
+	// The partition is unchanged iff old-metric ↔ new-metric is a
+	// bijection over the paths: every old-metric class maps to exactly one
+	// new-metric class and vice versa.
+	fwd := make(map[uint32]uint32, len(paths))
+	rev := make(map[uint32]uint32, len(paths))
+	for _, p := range paths {
+		o, n := oldTbl.MetricForPathQuiet(p), newTbl.MetricForPathQuiet(p)
+		if v, ok := fwd[o]; ok && v != n {
+			return true
+		}
+		fwd[o] = n
+		if v, ok := rev[n]; ok && v != o {
+			return true
+		}
+		rev[n] = o
+	}
+	return false
 }
 
 type Update struct {

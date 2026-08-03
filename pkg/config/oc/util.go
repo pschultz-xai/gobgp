@@ -200,6 +200,23 @@ func existPeerGroup(n string, b []PeerGroup) int {
 	return -1
 }
 
+// EqualNegotiated reports whether two ADD-PATH configs agree on the fields
+// whose change requires re-establishing the session: the capability
+// direction and the flat SendMax cap (SendMax is not in the OPEN, but a
+// SendMax change has always bounced the session here and D-034 kept that).
+// The Bendrr R-037 bucket knobs (LowestIgpMax, MinPaths) are deliberately
+// NOT part of this comparison: they alter only local export selection, so a
+// knob-only change is applied in place by updateNeighbor (with a soft reset
+// out) instead of bouncing the session. Full structural equality (Equal)
+// still includes them, so generic config change detection — Neighbor.Equal
+// on file reload in particular — sees knob-only edits.
+func (lhs *AddPathsConfig) EqualNegotiated(rhs *AddPathsConfig) bool {
+	if lhs == nil || rhs == nil {
+		return false
+	}
+	return lhs.Receive == rhs.Receive && lhs.SendMax == rhs.SendMax
+}
+
 func isAfiSafiChanged(x, y []AfiSafi) bool {
 	if len(x) != len(y) {
 		return true
@@ -209,7 +226,7 @@ func isAfiSafiChanged(x, y []AfiSafi) bool {
 		m[string(e.Config.AfiSafiName)] = x[i]
 	}
 	for _, e := range y {
-		if v, ok := m[string(e.Config.AfiSafiName)]; !ok || !v.Config.Equal(&e.Config) || !v.AddPaths.Config.Equal(&e.AddPaths.Config) || !v.MpGracefulRestart.Config.Equal(&e.MpGracefulRestart.Config) {
+		if v, ok := m[string(e.Config.AfiSafiName)]; !ok || !v.Config.Equal(&e.Config) || !v.AddPaths.Config.EqualNegotiated(&e.AddPaths.Config) || !v.MpGracefulRestart.Config.Equal(&e.MpGracefulRestart.Config) {
 			return true
 		}
 	}
@@ -219,7 +236,7 @@ func isAfiSafiChanged(x, y []AfiSafi) bool {
 func (n *Neighbor) NeedsResendOpenMessage(new *Neighbor) bool {
 	return !n.Config.Equal(&new.Config) ||
 		!n.Transport.Config.Equal(&new.Transport.Config) ||
-		!n.AddPaths.Config.Equal(&new.AddPaths.Config) ||
+		!n.AddPaths.Config.EqualNegotiated(&new.AddPaths.Config) ||
 		!n.AsPathOptions.Config.Equal(&new.AsPathOptions.Config) ||
 		!n.GracefulRestart.Config.Equal(&new.GracefulRestart.Config) ||
 		isAfiSafiChanged(n.AfiSafis, new.AfiSafis) ||

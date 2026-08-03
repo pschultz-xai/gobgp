@@ -1647,6 +1647,14 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 					alreadySent := targetPeer.hasPathAlreadyBeenSent(newPath)
 					newPath := s.filterpath(targetPeer, newPath, nil)
 					// if the path is not filtered and the path has already been sent or land in the limit, we can send it
+					// R-037 exemption: this RTC branch keeps the flat
+					// SendMax count cut and does NOT go through
+					// exportSelector — route-target membership routes are
+					// bookkeeping, not diversity-managed data paths, and
+					// Bendrr sets no bucket knobs on RTC families. Note
+					// the cut here is NOT equivalent to the bucket cut
+					// (bucket ties also key on AS_PATH length etc.); this
+					// is a deliberate scope exclusion, not an equivalence.
 					if newPath == nil {
 						bestList = []*table.Path{}
 					} else if alreadySent || targetPeer.getRoutesCount(f, newPath.GetPrefix()) < targetPeer.getAddPathSendMax(f) {
@@ -4122,10 +4130,47 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 		conf.Timers.Config = c.Timers.Config
 	}
 
+	// Bendrr R-037: the bucket-aware export knobs are excluded from
+	// EqualNegotiated, so a knob-only change reaches this non-bounce path.
+	// Apply the new values in place and re-sync the peer's export set with
+	// a non-deferral soft reset out below: the async dump announces the new
+	// cut and withdraws previously sent paths the new selection rejects.
+	exportKnobsChanged := false
+	if original.AddPaths.Config.LowestIgpMax != c.AddPaths.Config.LowestIgpMax ||
+		original.AddPaths.Config.MinPaths != c.AddPaths.Config.MinPaths {
+		conf.AddPaths.Config.LowestIgpMax = c.AddPaths.Config.LowestIgpMax
+		conf.AddPaths.Config.MinPaths = c.AddPaths.Config.MinPaths
+		exportKnobsChanged = true
+	}
+	for i := range conf.AfiSafis {
+		nc := c.GetAfiSafi(conf.AfiSafis[i].State.Family)
+		if nc == nil {
+			continue
+		}
+		ac := &conf.AfiSafis[i].AddPaths.Config
+		if ac.LowestIgpMax != nc.AddPaths.Config.LowestIgpMax ||
+			ac.MinPaths != nc.AddPaths.Config.MinPaths {
+			ac.LowestIgpMax = nc.AddPaths.Config.LowestIgpMax
+			ac.MinPaths = nc.AddPaths.Config.MinPaths
+			exportKnobsChanged = true
+		}
+	}
+	if exportKnobsChanged {
+		peer.fsm.logger.Info("Update ADD-PATH export selection knobs without session bounce",
+			slog.Uint64("LowestIgpMax", uint64(c.AddPaths.Config.LowestIgpMax)),
+			slog.Uint64("MinPaths", uint64(c.AddPaths.Config.MinPaths)))
+	}
+
 	isLimit, err := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
 	if err == nil {
 		peer.fsm.pConf.Update(&conf)
 		peer.fsm.lock.Unlock()
+		if exportKnobsChanged {
+			if rerr := s.softResetOut(addr, bgp.Family(0), false); rerr != nil {
+				peer.fsm.logger.Warn("Failed to re-sync export after ADD-PATH knob change",
+					slog.String("Err", rerr.Error()))
+			}
+		}
 		if bfdConfigChanged {
 			err = s.updateBfdPeer(
 				addr,

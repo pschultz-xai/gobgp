@@ -485,7 +485,13 @@ func (manager *TableManager) GetPathListWithSource(id string, rfList []bgp.Famil
 // The caller must guarantee no concurrent table mutation for the whole walk
 // (the BgpServer runs this inside a mgmt operation, which holds the server
 // lock exclusively).
-func (manager *TableManager) ReRankDestinations(fn func([]*Update)) (int, int) {
+// ReRankDestinations re-sorts every destination under the currently
+// installed location-metric table and hands batches of changed destinations
+// to fn. oldTbl is the table that was installed before the reload swap; it
+// feeds the bucket-membership change detection in reSort (a destination
+// whose ranked order held but whose metric partition moved still needs
+// re-export under R-037 bucket-aware selection).
+func (manager *TableManager) ReRankDestinations(oldTbl *LocationMetricTable, fn func([]*Update)) (int, int) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
 
@@ -497,7 +503,7 @@ func (manager *TableManager) ReRankDestinations(fn func([]*Update)) (int, int) {
 			for _, dests := range shard.mp {
 				for _, dest := range dests {
 					total++
-					if u, ok := dest.reSort(); ok {
+					if u, ok := dest.reSort(oldTbl); ok {
 						updates = append(updates, u)
 					}
 				}

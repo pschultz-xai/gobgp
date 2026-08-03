@@ -349,6 +349,47 @@ func TestEqualThroughLocationMetric_missingSentinelBucket(t *testing.T) {
 		"two sentinel-metric paths tie (degenerate sentinel bucket)")
 }
 
+// R-037: compareByMED only compares paths whose leftmost AS matches (absent
+// always-compare-med), so bucket equivalence is NOT transitive — the reason
+// exportSelector tests every candidate against the anchor instead of
+// assuming bucket members form a contiguous ranked prefix. Pin the
+// non-transitive triple: a~b and b~c but NOT a~c.
+func TestEqualThroughLocationMetricMEDNonTransitive(t *testing.T) {
+	defer resetLocationMetric()
+
+	installTestLocationMetric(104, map[uint32]uint32{
+		102: 50,
+	})
+
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+
+	withASAndMED := func(pathID uint32, asn, med uint32) *Path {
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{asn}),
+			}),
+			bgp.NewPathAttributeMultiExitDisc(med),
+			bgp.NewPathAttributeLargeCommunities([]*bgp.LargeCommunity{
+				{ASN: testGlobalAdmin, LocalData1: LocationLCDimension, LocalData2: 102},
+			}),
+		}
+		return NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri, ID: pathID}, false, attrs, time.Now(), false)
+	}
+
+	a := withASAndMED(1, 65001, 10)
+	b := withASAndMED(2, 65002, 500)
+	c := withASAndMED(3, 65001, 20)
+
+	assert.True(t, EqualThroughLocationMetric(a, b),
+		"different leftmost AS: MED incomparable, ties")
+	assert.True(t, EqualThroughLocationMetric(b, c),
+		"different leftmost AS: MED incomparable, ties")
+	assert.False(t, EqualThroughLocationMetric(a, c),
+		"same leftmost AS, different MED: no tie — equivalence is non-transitive")
+}
+
 func resetLocationMetric() {
 	ResetLocationMetric()
 }

@@ -2439,10 +2439,12 @@ func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
 	if lhs.SendMax != rhs.SendMax {
 		return false
 	}
-	// LowestIgpMax and MinPaths are deliberately excluded (Bendrr R-037):
-	// this equality feeds NeedsResendOpenMessage / isAfiSafiChanged only,
-	// and the selection knobs do not affect the negotiated ADD-PATH
-	// capability — changing them must not bounce established sessions.
+	if lhs.LowestIgpMax != rhs.LowestIgpMax {
+		return false
+	}
+	if lhs.MinPaths != rhs.MinPaths {
+		return false
+	}
 	return true
 }
 

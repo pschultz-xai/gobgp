@@ -392,6 +392,14 @@ func (s *BgpServer) evalExportDumpDest(peer *peer, fam *exportDumpFamily, dd exp
 			// Selection runs on the snapshot Loc-RIB path (the attributes
 			// ranking saw), not the post-policy rewrite fp.
 			if !sel.admit(path) {
+				// Soft-reset-out semantics (withdrawFiltered): a path the
+				// current selection rejects but that was previously sent —
+				// possible after a runtime knob change tightened the cut
+				// (R-037) — must be withdrawn, mirroring what the live
+				// ranked sync does when a path falls out of the cut.
+				if o.withdrawFiltered && !fp.IsWithdraw && peer.hasPathAlreadyBeenSent(fp) {
+					e.paths = append(e.paths, fp.Clone(true))
+				}
 				e.setMaxFiltered = append(e.setMaxFiltered, fp)
 				continue
 			}

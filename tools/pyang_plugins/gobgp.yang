@@ -1432,6 +1432,28 @@ module gobgp {
     }
   }
 
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:add-paths/bgp:config" {
+    leaf lowest-igp-max {
+      description
+        "Bendrr R-037 bucket-aware ADD-PATH export selection. When
+        non-zero, the export set for a destination is not the flat
+        top-send-max of ranked order but: up to lowest-igp-max paths that
+        tie with the best path through the location-metric comparator
+        slot (the best bucket), padded with next-ranked paths up to
+        min-paths when the bucket is thin. send-max remains the absolute
+        ceiling. Zero disables bucketing (flat top-send-max).";
+      type uint8;
+    }
+    leaf min-paths {
+      description
+        "Floor for bucket-aware selection: when the best bucket exports
+        fewer than min-paths paths, next-ranked paths outside the bucket
+        fill up to this count (pre-programmed backups). Meaningful only
+        with lowest-igp-max > 0.";
+      type uint8;
+    }
+  }
+
   augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:as-path-options/bgp:config" {
     leaf allow-as-path-loop-local {
       type boolean;
