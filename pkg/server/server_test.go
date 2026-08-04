@@ -4133,6 +4133,17 @@ func TestUpdatePeer(t *testing.T) {
 // TestRTCDeferralTimerRaceCondition tests that RTC deferral timer works correctly
 // and doesn't cause race conditions when multiple families are involved
 func TestRTCDeferralTimerRaceCondition(t *testing.T) {
+	// macOS only configures 127.0.0.1 on lo0 by default; the rest of 127/8
+	// needs an explicit alias. Probe for it and skip rather than fail on
+	// darwin hosts that don't have the alias.
+	if runtime.GOOS == "darwin" {
+		l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.201", "0"))
+		if err != nil {
+			t.Skipf("loopback alias 127.0.0.201 not present (%v); add it with `sudo ifconfig lo0 alias 127.0.0.201 up`", err)
+		}
+		_ = l.Close()
+	}
+
 	const (
 		asn      = 65000
 		holdTime = 180
