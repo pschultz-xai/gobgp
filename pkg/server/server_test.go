@@ -3312,6 +3312,170 @@ func TestListPathWithIdentifiers(t *testing.T) {
 	}
 }
 
+// TestGetTableExcludePrefixes covers GetTableRequest.exclude_prefixes: the
+// summary subtracts each excluded destination at exactly the weight the
+// count walk saw it (single-path, multi-path via ADD-PATH identifiers),
+// absent prefixes subtract nothing, host-form entries canonicalize to
+// their masked destination, and malformed / family-mismatched entries and
+// unsupported table types fail the whole request instead of returning a
+// count the caller would wrongly trust as exclusion-adjusted.
+func TestGetTableExcludePrefixes(t *testing.T) {
+	assert := assert.New(t)
+	s := NewBgpServer()
+	go s.Serve()
+	err := s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	assert.NoError(err)
+	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	family := &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}
+	attrs := []*api.Attribute{
+		{Attr: &api.Attribute_Origin{Origin: &api.OriginAttribute{Origin: 0}}},
+		{Attr: &api.Attribute_NextHop{NextHop: &api.NextHopAttribute{NextHop: "10.0.0.1"}}},
+	}
+	addPath := func(prefix string, prefixLen uint32, identifier uint32) {
+		nlri := &api.NLRI{Nlri: &api.NLRI_Prefix{Prefix: &api.IPAddressPrefix{
+			Prefix:    prefix,
+			PrefixLen: prefixLen,
+		}}}
+		_, err := s.AddPath(apiutil.AddPathRequest{Paths: []*apiutil.Path{mustApi2apiutilPath(&api.Path{
+			Family:     family,
+			Nlri:       nlri,
+			Pattrs:     attrs,
+			Identifier: identifier,
+		})}})
+		assert.NoError(err)
+	}
+	// 3 destinations, 4 paths: 10.2.0.0/24 carries two ADD-PATH
+	// identifiers so its exclusion must subtract 1 destination, 2 paths.
+	addPath("10.1.0.0", 24, 0)
+	addPath("10.2.0.0", 24, 1)
+	addPath("10.2.0.0", 24, 2)
+	addPath("10.3.0.0", 24, 0)
+
+	getTable := func(exclude ...string) (*api.GetTableResponse, error) {
+		return s.GetTable(context.Background(), &api.GetTableRequest{
+			TableType:       api.TableType_TABLE_TYPE_GLOBAL,
+			Family:          family,
+			ExcludePrefixes: exclude,
+		})
+	}
+	assertCounts := func(wantDests, wantPaths uint64, exclude ...string) {
+		t.Helper()
+		rsp, err := getTable(exclude...)
+		if assert.NoError(err) {
+			assert.Equal(wantDests, rsp.NumDestination, "destinations excluding %v", exclude)
+			assert.Equal(wantPaths, rsp.NumPath, "paths excluding %v", exclude)
+		}
+	}
+
+	assertCounts(3, 4)                                              // no exclusions: the plain summary
+	assertCounts(3, 4, "10.9.0.0/24")                               // absent prefix subtracts nothing
+	assertCounts(2, 3, "10.1.0.0/24")                               // single-path destination
+	assertCounts(2, 2, "10.2.0.0/24")                               // multi-path destination: 1 dest, 2 paths
+	assertCounts(1, 1, "10.1.0.0/24", "10.2.0.0/24", "10.9.0.0/24") // mixed, absent mixed in
+	assertCounts(2, 3, "10.1.0.5/24")                               // host-form canonicalizes to 10.1.0.0/24
+	assertCounts(3, 4, "10.1.0.0/25")                               // different masklen is a different destination: exact match, no LPM
+
+	// A duplicate exclusion — verbatim or via mask aliasing — names the
+	// same destination and must subtract exactly once, never underflow.
+	assertCounts(2, 3, "10.1.0.0/24", "10.1.0.0/24")
+	assertCounts(2, 3, "10.1.0.0/24", "10.1.0.5/24")
+	assertCounts(2, 2, "10.2.0.0/24", "10.2.0.9/24", "10.2.0.0/24")
+
+	_, err = getTable("not-a-prefix")
+	assert.ErrorContains(err, "not-a-prefix")
+	_, err = getTable("2001:db8::/64") // v6 exclusion on a v4 family read
+	assert.ErrorContains(err, "does not match the requested family")
+	_, err = s.GetTable(context.Background(), &api.GetTableRequest{
+		TableType:       api.TableType_TABLE_TYPE_ADJ_IN,
+		Family:          family,
+		Name:            "127.0.0.1",
+		ExcludePrefixes: []string{"10.1.0.0/24"},
+	})
+	assert.ErrorContains(err, "not supported for table type")
+	_, err = s.GetTable(context.Background(), &api.GetTableRequest{
+		TableType:       api.TableType_TABLE_TYPE_VRF,
+		Family:          family,
+		Name:            "vrf",
+		ExcludePrefixes: []string{"10.1.0.0/24"},
+	})
+	assert.ErrorContains(err, "not supported for table type")
+	// Non-unicast SAFI: the exclusion NLRI could never exact-match, so it
+	// must reject rather than silently subtract nothing.
+	_, err = s.GetTable(context.Background(), &api.GetTableRequest{
+		TableType:       api.TableType_TABLE_TYPE_GLOBAL,
+		Family:          &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_MPLS_VPN},
+		ExcludePrefixes: []string{"10.1.0.0/24"},
+	})
+	assert.ErrorContains(err, "unicast")
+}
+
+// TestGetTableExcludePrefixesIPv6 is the IPv6-unicast positive case: the
+// exclusion machinery is family-symmetric even though bendrr's canaries
+// are v4-only today.
+func TestGetTableExcludePrefixesIPv6(t *testing.T) {
+	assert := assert.New(t)
+	s := NewBgpServer()
+	go s.Serve()
+	err := s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	assert.NoError(err)
+	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	family := &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}
+	for _, prefix := range []string{"2001:db8:1::", "2001:db8:2::"} {
+		nlri := &api.NLRI{Nlri: &api.NLRI_Prefix{Prefix: &api.IPAddressPrefix{
+			Prefix:    prefix,
+			PrefixLen: 48,
+		}}}
+		attrs := []*api.Attribute{
+			{Attr: &api.Attribute_Origin{Origin: &api.OriginAttribute{Origin: 0}}},
+			{Attr: &api.Attribute_MpReach{MpReach: &api.MpReachNLRIAttribute{
+				Family:   family,
+				NextHops: []string{"2001:db8::1"},
+				Nlris:    []*api.NLRI{nlri},
+			}}},
+		}
+		_, err := s.AddPath(apiutil.AddPathRequest{Paths: []*apiutil.Path{mustApi2apiutilPath(&api.Path{
+			Family: family,
+			Nlri:   nlri,
+			Pattrs: attrs,
+		})}})
+		assert.NoError(err)
+	}
+
+	getTable := func(exclude ...string) (*api.GetTableResponse, error) {
+		return s.GetTable(context.Background(), &api.GetTableRequest{
+			TableType:       api.TableType_TABLE_TYPE_GLOBAL,
+			Family:          family,
+			ExcludePrefixes: exclude,
+		})
+	}
+	rsp, err := getTable()
+	if assert.NoError(err) {
+		assert.Equal(uint64(2), rsp.NumDestination)
+		assert.Equal(uint64(2), rsp.NumPath)
+	}
+	rsp, err = getTable("2001:db8:1::/48")
+	if assert.NoError(err) {
+		assert.Equal(uint64(1), rsp.NumDestination)
+		assert.Equal(uint64(1), rsp.NumPath)
+	}
+	_, err = getTable("10.1.0.0/24") // v4 exclusion on a v6 family read
+	assert.ErrorContains(err, "does not match the requested family")
+}
+
 func makeNeighborConfig(port int32) *oc.Neighbor {
 	return &oc.Neighbor{
 		Config: oc.NeighborConfig{
@@ -3855,7 +4019,7 @@ func TestEBGPRouteStuck(test *testing.T) {
 	assertPathCount := func(t assert.TestingT, peer *BgpServer, expected int) {
 		var info *table.TableInfo
 		if peer.active() == nil {
-			info, _ = peer.getRibInfo("", bgp.RF_IPv4_UC)
+			info, _ = peer.getRibInfo("", bgp.RF_IPv4_UC, nil)
 		} else {
 			tbl, _ := peer.globalRib.GetTable(bgp.RF_IPv4_UC)
 			info = tbl.Info()

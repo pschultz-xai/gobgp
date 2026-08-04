@@ -3365,7 +3365,7 @@ func (s *BgpServer) ListPath(r apiutil.ListPathRequest, fn func(prefix bgp.NLRI,
 	return err
 }
 
-func (s *BgpServer) getRibInfo(addr string, family bgp.Family) (info *table.TableInfo, err error) {
+func (s *BgpServer) getRibInfo(addr string, family bgp.Family, excludePrefixes []netip.Prefix) (info *table.TableInfo, err error) {
 	err = s.mgmtOperation(func() error {
 		m := s.globalRib
 		id := table.GLOBAL_RIB_NAME
@@ -3395,7 +3395,35 @@ func (s *BgpServer) getRibInfo(addr string, family bgp.Family) (info *table.Tabl
 
 		info = tbl.Info(table.TableInfoOptions{ID: id, AS: as})
 
-		return err
+		// Exclusions are subtracted HERE, inside the same mgmtOperation as
+		// the Info walk above, and that placement is the feature: the whole
+		// closure runs under BgpServer's exclusive shared.mu (handleMGMTOp
+		// drains the mgmt channel holding it), while every RIB-mutation
+		// path — handleFSMMessage for wire updates, and the AddPath/
+		// DeletePath API verbs, which are themselves mgmtOperations — also
+		// serializes through that lock. So no announce/withdraw can land
+		// between the count and these lookups, and the subtraction is
+		// exact by construction. A future rebase onto finer-grained server
+		// locking must re-review this invariant. Each lookup is
+		// exact-match (SelectDestination — no longest-prefix fallback) and
+		// counts paths through the same (id, as) filter Info used, so an
+		// excluded destination is subtracted at exactly the weight the
+		// walk counted it; an absent prefix subtracts nothing.
+		for _, p := range excludePrefixes {
+			nlri, err := bgp.NewIPAddrPrefix(p)
+			if err != nil {
+				// Unreachable after parseExcludePrefixes (parsed, masked,
+				// family-checked) — kept as an InvalidArgument boundary
+				// rather than surfacing codes.Unknown.
+				return status.Errorf(codes.InvalidArgument, "exclude prefix %s: %v", p, err)
+			}
+			if d := tbl.SelectDestination(nlri, table.DestinationSelectOption{ID: id, AS: as}); d != nil {
+				info.NumDestination--
+				info.NumPath -= d.GetKnownPathListLength()
+			}
+		}
+
+		return nil
 	}, true)
 	return info, err
 }
@@ -3468,20 +3496,29 @@ func (s *BgpServer) GetTable(ctx context.Context, r *api.GetTableRequest) (*api.
 	if r.Family != nil {
 		family = bgp.NewFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
 	}
+	excludePrefixes, err := parseExcludePrefixes(r.ExcludePrefixes, family)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	var in bool
-	var err error
 	var info *table.TableInfo
 	switch r.TableType {
 	case api.TableType_TABLE_TYPE_UNSPECIFIED:
 		return nil, status.Error(codes.InvalidArgument, "unspecified table type")
 	case api.TableType_TABLE_TYPE_GLOBAL, api.TableType_TABLE_TYPE_LOCAL:
-		info, err = s.getRibInfo(r.Name, family)
+		info, err = s.getRibInfo(r.Name, family, excludePrefixes)
 	case api.TableType_TABLE_TYPE_ADJ_IN:
 		in = true
 		fallthrough
 	case api.TableType_TABLE_TYPE_ADJ_OUT:
+		if len(excludePrefixes) > 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "exclude_prefixes is not supported for table type %s", r.TableType)
+		}
 		info, err = s.getAdjRibInfo(r.Name, family, in)
 	case api.TableType_TABLE_TYPE_VRF:
+		if len(excludePrefixes) > 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "exclude_prefixes is not supported for table type %s", r.TableType)
+		}
 		info, err = s.getVrfRibInfo(r.Name, family)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown table type %d", r.TableType)
@@ -3491,11 +3528,63 @@ func (s *BgpServer) GetTable(ctx context.Context, r *api.GetTableRequest) (*api.
 		return nil, err
 	}
 
+	// Insurance against any residual over-subtraction (exclusions are
+	// deduped, but a signed count must never wrap through the uint64 cast
+	// into 1<<64-1). Unreachable today — firing means Info's walk and
+	// SelectDestination's exclusion lookup no longer count through the
+	// same filters — so a clamp must be LOUD: silently returning a
+	// plausible zero would bury exactly the divergence it exists to catch.
+	if info.NumDestination < 0 || info.NumPath < 0 || info.NumAccepted < 0 {
+		s.logger.Error("GetTable summary went negative after exclude_prefixes subtraction — Info/SelectDestination filter divergence, clamping to zero",
+			slog.String("Topic", "Table"),
+			slog.Int("NumDestination", info.NumDestination),
+			slog.Int("NumPath", info.NumPath),
+			slog.Int("NumAccepted", info.NumAccepted),
+			slog.Any("ExcludePrefixes", r.ExcludePrefixes),
+		)
+	}
 	return &api.GetTableResponse{
-		NumDestination: uint64(info.NumDestination),
-		NumPath:        uint64(info.NumPath),
-		NumAccepted:    uint64(info.NumAccepted),
+		NumDestination: uint64(max(info.NumDestination, 0)),
+		NumPath:        uint64(max(info.NumPath, 0)),
+		NumAccepted:    uint64(max(info.NumAccepted, 0)),
 	}, nil
+}
+
+// parseExcludePrefixes validates GetTableRequest.exclude_prefixes: the
+// family must be IPv4/IPv6 unicast (any other family's NLRI would never
+// exact-match an IPAddrPrefix lookup and the exclusion would silently
+// subtract nothing), and every entry must parse as a CIDR prefix of the
+// requested family. A silently dropped exclusion would return a count the
+// caller believes is exclusion-adjusted, so all of those fail the whole
+// request instead. Prefixes are canonicalized (masked) so "10.1.0.5/24"
+// and "10.1.0.0/24" name the same destination — and then deduplicated: an
+// exclusion names a destination, not an occurrence, so a duplicate must
+// not subtract twice (the counts would underflow through the uint64 cast).
+func parseExcludePrefixes(prefixes []string, family bgp.Family) ([]netip.Prefix, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	if family != bgp.RF_IPv4_UC && family != bgp.RF_IPv6_UC {
+		return nil, fmt.Errorf("exclude_prefixes is only supported for the IPv4/IPv6 unicast families, not %s", family)
+	}
+	seen := make(map[netip.Prefix]bool, len(prefixes))
+	out := make([]netip.Prefix, 0, len(prefixes))
+	for _, s := range prefixes {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("exclude prefix %q: %w", s, err)
+		}
+		if p.Addr().Is4() != (family == bgp.RF_IPv4_UC) {
+			return nil, fmt.Errorf("exclude prefix %q does not match the requested family %s", s, family)
+		}
+		p = p.Masked()
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 func (s *BgpServer) GetBgp(ctx context.Context, r *api.GetBgpRequest) (rsp *api.GetBgpResponse, err error) {
