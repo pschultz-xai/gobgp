@@ -380,6 +380,7 @@ func TestSoftResetOutSecondaryRouteWithdrawsAdvertisedFallback(t *testing.T) {
 		require.NoError(t, err)
 		cleanInfiniteChannel(target.fsm.outgoingCh)
 		require.NoError(t, s.StopBgp(ctx, &api.StopBgpRequest{}))
+		s.bfdServer.Stop()
 	})
 
 	const primaryCommunity = uint32(65000)<<16 | 1
