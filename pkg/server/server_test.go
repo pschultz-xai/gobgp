@@ -1785,7 +1785,56 @@ func TestFilterpathWithRejectPolicy(t *testing.T) {
 		} else {
 			assert.False(t, path2.IsWithdraw)
 		}
+		// Bendrr (R-230): mirror the enqueue bookkeeping the production
+		// callers perform on filterpath's output — the synthetic withdraw
+		// above is only emitted because the previous (accepted) iteration
+		// was recorded as sent.
+		p2.updateRoutes(path2)
 	}
+}
+
+// TestFilterpathSuppressesNeverAdvertisedWithdraw pins the R-230 suppression
+// gate: a withdraw (synthetic via 'old', or direct) for a destination this
+// peer was never sent must come back nil instead of hitting the wire, and a
+// stale send-max flag on the suppressed path must be cleared, not leaked.
+func TestFilterpathSuppressesNeverAdvertisedWithdraw(t *testing.T) {
+	rib1 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	p1 := newPeerandInfo(t, 1, 2, "192.168.0.1", rib1)
+	rib2 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	p2 := newPeerandInfo(t, 1, 3, "192.168.0.2", rib2)
+	s := NewBgpServer()
+
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.20.30.0/24"))
+	pa := []bgp.PathAttributeInterface{bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{1})}), bgp.NewPathAttributeLocalPref(200)}
+	announce := table.NewPath(bgp.RF_IPv4_UC, p1.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, pa, time.Now(), false)
+	new, _ := process(rib2, []*table.Path{announce})
+	assert.Equal(t, new, announce)
+
+	// Direct withdraw, never advertised: suppressed.
+	withdraw := announce.Clone(true)
+	assert.Nil(t, s.filterpath(p2, withdraw, nil))
+
+	// Synthetic old-withdraw (new==nil, old accepted by policy) with the old
+	// never actually sent: suppressed.
+	assert.Nil(t, s.filterpath(p2, nil, announce))
+
+	// A stale send-max flag on the never-sent path is cleared by the gate.
+	p2.setPathSendMaxFiltered(withdraw)
+	assert.Nil(t, s.filterpath(p2, withdraw, nil))
+	assert.False(t, p2.isPathSendMaxFiltered(withdraw))
+
+	// Once the announce is recorded as sent, the same withdraw passes.
+	sent := s.filterpath(p2, announce, nil)
+	assert.NotNil(t, sent)
+	p2.updateRoutes(sent)
+	got := s.filterpath(p2, withdraw, nil)
+	assert.NotNil(t, got)
+	assert.True(t, got.IsWithdraw)
+
+	// And the enqueued withdraw clears the sent bit: the next one is
+	// suppressed again.
+	p2.updateRoutes(got)
+	assert.Nil(t, s.filterpath(p2, withdraw, nil))
 }
 
 func TestPeerGroup(test *testing.T) {
