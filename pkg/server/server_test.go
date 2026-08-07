@@ -1794,9 +1794,10 @@ func TestFilterpathWithRejectPolicy(t *testing.T) {
 }
 
 // TestFilterpathSuppressesNeverAdvertisedWithdraw pins the R-230 suppression
-// gate: a withdraw (synthetic via 'old', or direct) for a destination this
-// peer was never sent must come back nil instead of hitting the wire, and a
-// stale send-max flag on the suppressed path must be cleared, not leaked.
+// gate: a withdraw (direct, or synthetic via the policy-rejected 'new' +
+// accepted 'old' shape) for a destination this peer was never sent must come
+// back nil instead of hitting the wire, and a stale send-max flag on the
+// suppressed path must be cleared, not leaked.
 func TestFilterpathSuppressesNeverAdvertisedWithdraw(t *testing.T) {
 	rib1 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
 	p1 := newPeerandInfo(t, 1, 2, "192.168.0.1", rib1)
@@ -1804,9 +1805,34 @@ func TestFilterpathSuppressesNeverAdvertisedWithdraw(t *testing.T) {
 	p2 := newPeerandInfo(t, 1, 3, "192.168.0.2", rib2)
 	s := NewBgpServer()
 
+	// Export policy on p2 rejecting community 100:100, so a tagged 'new'
+	// path drives filterpath's synthetic old-withdraw branch.
+	comSet, _ := table.NewCommunitySet(oc.CommunitySet{
+		CommunitySetName: "comset1",
+		CommunityList:    []string{"100:100"},
+	})
+	require.NoError(t, p2.policy.AddDefinedSet(comSet, false))
+	policy, _ := table.NewPolicy(oc.PolicyDefinition{
+		Name: "policy1",
+		Statements: []oc.Statement{{
+			Name: "stmt1",
+			Conditions: oc.Conditions{
+				BgpConditions: oc.BgpConditions{
+					MatchCommunitySet: oc.MatchCommunitySet{CommunitySet: "comset1"},
+				},
+			},
+			Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_REJECT_ROUTE},
+		}},
+	})
+	require.NoError(t, p2.policy.AddPolicy(policy, false))
+	require.NoError(t, p2.policy.AddPolicyAssignment(p2.TableID(), table.POLICY_DIRECTION_EXPORT,
+		[]*oc.PolicyDefinition{{Name: "policy1"}}, table.ROUTE_TYPE_ACCEPT))
+
 	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.20.30.0/24"))
 	pa := []bgp.PathAttributeInterface{bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{1})}), bgp.NewPathAttributeLocalPref(200)}
 	announce := table.NewPath(bgp.RF_IPv4_UC, p1.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, pa, time.Now(), false)
+	paTagged := append(append([]bgp.PathAttributeInterface{}, pa...), bgp.NewPathAttributeCommunities([]uint32{100<<16 | 100}))
+	tagged := table.NewPath(bgp.RF_IPv4_UC, p1.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, paTagged, time.Now(), false)
 	new, _ := process(rib2, []*table.Path{announce})
 	assert.Equal(t, new, announce)
 
@@ -1814,22 +1840,26 @@ func TestFilterpathSuppressesNeverAdvertisedWithdraw(t *testing.T) {
 	withdraw := announce.Clone(true)
 	assert.Nil(t, s.filterpath(p2, withdraw, nil))
 
-	// Synthetic old-withdraw (new==nil, old accepted by policy) with the old
-	// never actually sent: suppressed.
-	assert.Nil(t, s.filterpath(p2, nil, announce))
+	// Synthetic old-withdraw: 'new' rejected by policy, 'old' accepted by
+	// policy but never actually sent — the withdraw the pre-gate code
+	// emitted here goes to a peer that never had the route: suppressed.
+	assert.Nil(t, s.filterpath(p2, tagged, announce))
 
 	// A stale send-max flag on the never-sent path is cleared by the gate.
 	p2.setPathSendMaxFiltered(withdraw)
 	assert.Nil(t, s.filterpath(p2, withdraw, nil))
 	assert.False(t, p2.isPathSendMaxFiltered(withdraw))
 
-	// Once the announce is recorded as sent, the same withdraw passes.
+	// Once the announce is recorded as sent, both shapes pass again.
 	sent := s.filterpath(p2, announce, nil)
 	assert.NotNil(t, sent)
 	p2.updateRoutes(sent)
 	got := s.filterpath(p2, withdraw, nil)
 	assert.NotNil(t, got)
 	assert.True(t, got.IsWithdraw)
+	synthetic := s.filterpath(p2, tagged, announce)
+	assert.NotNil(t, synthetic)
+	assert.True(t, synthetic.IsWithdraw)
 
 	// And the enqueued withdraw clears the sent bit: the next one is
 	// suppressed again.

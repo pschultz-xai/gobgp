@@ -459,10 +459,28 @@ func (s *BgpServer) flushExportDumpChunk(peer *peer, gen uint64, entries []expor
 // is: the walk flushes from a snapshot older than the live withdraw, and the
 // only thing that stops a stale snapshot entry from re-announcing the
 // withdrawn path is the live delta claiming the destination dirty — which a
-// suppressed (never-enqueued) withdraw would not do. Taking d.mu here also
-// orders the check after the final flush's bookkeeping (flushExportDumpChunk
-// holds d.mu across updateRoutes), so "no dump in flight" guarantees the
-// sent bits the suppression reads already reflect the whole dump.
+// suppressed (never-enqueued) withdraw would not do.
+//
+// Why the check is race-safe: dump starts are NOT serialized with live
+// propagation (handleFSMMessage runs on per-peer FSM goroutines under the
+// mgmt READ lock, concurrently with propagateUpdate). The guarantee is
+// ordering through d.mu plus RIB order instead. A suppression check and
+// startExportDump's inflight install are totally ordered by d.mu; if the
+// check observes "no dump in flight", any dump that starts later snapshots
+// the CURRENT RIB — which already excludes the withdrawn path, because
+// rib.Update ran before the fan-out that is doing the suppressing — so no
+// stale entry containing it can exist. On the finish side,
+// finishExportDump clears inflight in a d.mu critical section after the
+// final flush's updateRoutes (flushExportDumpChunk holds d.mu across it),
+// so "no dump in flight" also guarantees the sent bits the suppression
+// reads reflect the whole dump.
+//
+// Scope caveat: the legacy synchronous secondary-route dump in
+// startExportDump returns before ever setting inflight, so this reads
+// false for its whole duration. That path is excluded from racing the
+// suppression by a different lock — it runs under
+// routeRefreshInProgress.Lock(), against the RLock the fan-out holds
+// across the gate — not by this flag.
 func (peer *peer) hasExportDumpInFlight() bool {
 	d := &peer.dump
 	d.mu.Lock()

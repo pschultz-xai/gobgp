@@ -748,10 +748,17 @@ func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
 	// flushes from a snapshot older than this withdraw, and only an
 	// ENQUEUED live delta claims the destination dirty — suppressing here
 	// would let a stale snapshot entry re-announce the withdrawn path (see
-	// hasExportDumpInFlight). The suppressed path is leaving the RIB, so
+	// hasExportDumpInFlight for why the check is race-safe against
+	// concurrent dump starts). The suppressed path is leaving the RIB, so
 	// its send-max flag is dead state whatever the caller — clear it here,
 	// because callers that used to clear it (the ADD-PATH withdraw
-	// backfill) only see the nil.
+	// backfill) only see the nil. Two deliberate side effects of the nil:
+	// filterpath now mutates peer adv state on suppressed withdraws (the
+	// flag clear — relevant to informational callers like getAdjRibInfo,
+	// which already reached other mutating branches here), and the ranked
+	// exportSelector no longer burns a SendMax/bucket slot on a never-sent
+	// LLGR-stale demotion withdraw (sel.admit never sees it; the freed
+	// slot promotes a real path).
 	if path != nil && path.IsWithdraw &&
 		!peer.hasExportDumpInFlight() && !peer.hasPathAlreadyBeenSent(path) {
 		peer.unsetPathSendMaxFiltered(path)
@@ -1620,6 +1627,17 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 				if newPath.IsWithdraw {
 					bestList = func() []*table.Path {
 						l := []*table.Path{}
+						// Bendrr (R-230): hoisted out of the per-withdraw
+						// loop — d.mu is a per-peer serialization point
+						// (markExportDumpDirty on every enqueue batch, the
+						// dump flush holds it across updateRoutes), so one
+						// read per peer event, not one per path. Reading a
+						// stale "false" while a dump starts mid-event is
+						// safe by the same argument as the check itself
+						// (see hasExportDumpInFlight): a dump starting
+						// after this read snapshots the current RIB, which
+						// already excludes these withdrawn paths.
+						dumpInFlight := targetPeer.hasExportDumpInFlight()
 						for _, d := range dsts {
 							toDelete := d.GetWithdrawnPath()
 							toActuallyDelete := make([]*table.Path, 0, len(toDelete))
@@ -1654,7 +1672,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								// bookkeeping cleanup the
 								// unsetPathSendMaxFiltered skip below does
 								// on the slow path.
-								if peerVrf == "" && !targetPeer.hasExportDumpInFlight() &&
+								if peerVrf == "" && !dumpInFlight &&
 									!targetPeer.hasPathAlreadyBeenSent(withdrawn) {
 									targetPeer.unsetPathSendMaxFiltered(withdrawn)
 									continue

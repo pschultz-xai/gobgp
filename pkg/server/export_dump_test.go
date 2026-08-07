@@ -441,6 +441,98 @@ func TestExportDumpAddPathWithdrawBackfillDuringDump(t *testing.T) {
 	assert.Equal(t, 1, skipped)
 }
 
+// TestAddPathWithdrawFastSkipNeverAdvertised pins the R-230 pre-filterpath
+// fast skip on the ADD-PATH withdraw backfill in steady state (no dump in
+// flight): a withdraw for a path never booked as sent to the peer produces
+// no outgoing traffic and clears a stale send-max flag, while a withdraw for
+// a sent path (same destination, different LocalID — the per-LocalID keying
+// the fast skip relies on pre-filterpath) still reaches the wire.
+func TestAddPathWithdrawFastSkipNeverAdvertised(t *testing.T) {
+	s := newExportDumpTestServer(t)
+	t.Cleanup(func() {
+		require.NoError(t, s.StopBgp(context.Background(), &api.StopBgpRequest{}))
+		s.bfdServer.Stop()
+	})
+
+	peerAddr := netip.MustParseAddr("10.0.0.1")
+	p := newPeerandInfo(t, 65001, 65002, peerAddr.String(), s.globalRib)
+	p.policy = s.policy
+	p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{
+		bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND,
+	})
+	err := s.mgmtOperation(func() error {
+		s.neighborMap[peerAddr] = p
+		return nil
+	}, true)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := s.mgmtOperation(func() error {
+			delete(s.neighborMap, peerAddr)
+			return nil
+		}, false)
+		require.NoError(t, err)
+		cleanInfiniteChannel(p.fsm.outgoingCh)
+	})
+
+	makeSourcePath := func(source string, isWithdraw bool) *table.Path {
+		t.Helper()
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.0/32"))
+		require.NoError(t, err)
+		nextHop, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.254"))
+		require.NoError(t, err)
+		sourceAddr := netip.MustParseAddr(source)
+		return table.NewPath(bgp.RF_IPv4_UC, &table.PeerInfo{
+			AS:           65010,
+			ID:           sourceAddr,
+			Address:      sourceAddr,
+			LocalAS:      65001,
+			LocalID:      netip.MustParseAddr("1.1.1.1"),
+			LocalAddress: netip.MustParseAddr("1.1.1.1"),
+		}, bgp.PathNLRI{NLRI: nlri}, isWithdraw, []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, []uint32{65010}),
+			}),
+			nextHop,
+		}, time.Now(), false)
+	}
+
+	// Seed two paths for one destination while the peer is not advertising
+	// (no bookkeeping), then book only pathB as sent — the state a scoped-
+	// export peer is in after its establish dump announced the accepted
+	// subset. pathA additionally carries a stale send-max flag.
+	pathA := makeSourcePath("10.0.0.2", false)
+	pathB := makeSourcePath("10.0.0.3", false)
+	s.propagateUpdate(nil, []*table.Path{pathA, pathB})
+	p.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED)
+	p.updateRoutes(pathB)
+	p.setPathSendMaxFiltered(pathA)
+
+	// Withdraw the never-sent path: the fast skip must produce NO outgoing
+	// traffic and must clear the stale flag.
+	s.propagateUpdate(nil, []*table.Path{makeSourcePath("10.0.0.2", true)})
+	select {
+	case o := <-p.fsm.outgoingCh.Out():
+		t.Fatalf("never-advertised withdraw reached the wire: %#v", o)
+	case <-time.After(300 * time.Millisecond):
+	}
+	assert.False(t, p.isPathSendMaxFiltered(pathA), "stale send-max flag must be cleared by the fast skip")
+
+	// Withdraw the sent path: same destination, different LocalID — must
+	// still reach the wire.
+	s.propagateUpdate(nil, []*table.Path{makeSourcePath("10.0.0.3", true)})
+	select {
+	case o := <-p.fsm.outgoingCh.Out():
+		msg, ok := o.(*fsmOutgoingMsg)
+		require.True(t, ok)
+		require.Len(t, msg.Paths, 1)
+		assert.True(t, msg.Paths[0].IsWithdraw)
+		assert.Equal(t, pathB.LocalID(), msg.Paths[0].LocalID())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the sent path's withdraw")
+	}
+}
+
 // TestExportDumpLiveUpdatesDuringDumpConverge races live propagation against
 // a running establish dump: whatever the interleaving (dirty-skip before the
 // dump reaches the destination, or fresh update enqueued after a stale
