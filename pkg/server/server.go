@@ -157,7 +157,8 @@ type BgpServer struct {
 	logger       *slog.Logger
 	logLevelVar  *slog.LevelVar
 	timingHook   FSMTimingHook
-	// filterpathEntries counts filterpath invocations. Its only consumer is
+	// filterpathEntries counts (*BgpServer).filterpath invocations (the
+	// package-level filterpath helper is not counted). Its only consumer is
 	// the test pinning that the R-230 ADD-PATH withdraw-backfill fast skip
 	// really bypasses filterpath (the skip is observationally identical to
 	// filterpath's own suppression gate by design, so no black-box
