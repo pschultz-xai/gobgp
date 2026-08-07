@@ -3997,6 +3997,20 @@ func TestAddDefinedSetReplace(t *testing.T) {
 }
 
 func TestEBGPRouteStuck(test *testing.T) {
+	// macOS only configures 127.0.0.1 on lo0 by default; the rest of 127/8
+	// needs an explicit alias. Probe for the three this test binds and skip
+	// rather than fail on darwin hosts that don't have them (same class as
+	// TestRTCDeferralTimerRaceCondition, Bendrr R-229).
+	if runtime.GOOS == "darwin" {
+		for i := range 3 {
+			addr := fmt.Sprintf("127.0.0.%d", 100+i)
+			l, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
+			if err != nil {
+				test.Skipf("loopback alias %s not present (%v); add it with `sudo ifconfig lo0 alias %s up`", addr, err, addr)
+			}
+			_ = l.Close()
+		}
+	}
 	var peers []*BgpServer
 	for i, s := range []struct {
 		routerId string

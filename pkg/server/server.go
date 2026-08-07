@@ -744,10 +744,16 @@ func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
 	// are keyed in the same space as their bookkeeping. EORs never match:
 	// they are not withdraws. Soft-reset heal withdraws do not pass through
 	// here (export_dump.go gates them on hasPathAlreadyBeenSent itself).
-	// The suppressed path is leaving the RIB, so its send-max flag is dead
-	// state whatever the caller — clear it here, because callers that used
-	// to clear it (the ADD-PATH withdraw backfill) only see the nil.
-	if path != nil && path.IsWithdraw && !peer.hasPathAlreadyBeenSent(path) {
+	// The suppression stands down while a dump walk is in flight: the walk
+	// flushes from a snapshot older than this withdraw, and only an
+	// ENQUEUED live delta claims the destination dirty — suppressing here
+	// would let a stale snapshot entry re-announce the withdrawn path (see
+	// hasExportDumpInFlight). The suppressed path is leaving the RIB, so
+	// its send-max flag is dead state whatever the caller — clear it here,
+	// because callers that used to clear it (the ADD-PATH withdraw
+	// backfill) only see the nil.
+	if path != nil && path.IsWithdraw &&
+		!peer.hasExportDumpInFlight() && !peer.hasPathAlreadyBeenSent(path) {
 		peer.unsetPathSendMaxFiltered(path)
 		return nil
 	}
@@ -1637,12 +1643,19 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								// rewrites the rest with ToLocal (the same
 								// trap as the lookupPath note above), and
 								// those fall through to the keyed-correct
-								// gate inside filterpath. Clearing the
-								// send-max flag preserves the displaced-
-								// but-never-sent bookkeeping cleanup the
+								// gate inside filterpath. Stands down while
+								// a dump walk is in flight, like the
+								// filterpath gate: a suppressed withdraw
+								// claims nothing dirty, so a stale snapshot
+								// flush could re-announce the withdrawn path
+								// AND the R-212 ranked re-sync below would be
+								// skipped. Clearing the send-max flag
+								// preserves the displaced-but-never-sent
+								// bookkeeping cleanup the
 								// unsetPathSendMaxFiltered skip below does
 								// on the slow path.
-								if peerVrf == "" && !targetPeer.hasPathAlreadyBeenSent(withdrawn) {
+								if peerVrf == "" && !targetPeer.hasExportDumpInFlight() &&
+									!targetPeer.hasPathAlreadyBeenSent(withdrawn) {
 									targetPeer.unsetPathSendMaxFiltered(withdrawn)
 									continue
 								}

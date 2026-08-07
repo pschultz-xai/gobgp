@@ -454,6 +454,22 @@ func (s *BgpServer) flushExportDumpChunk(peer *peer, gen uint64, entries []expor
 	return len(paths), skipped, true
 }
 
+// hasExportDumpInFlight reports whether a dump walk is currently running.
+// The R-230 never-advertised withdraw suppression must stand down while one
+// is: the walk flushes from a snapshot older than the live withdraw, and the
+// only thing that stops a stale snapshot entry from re-announcing the
+// withdrawn path is the live delta claiming the destination dirty — which a
+// suppressed (never-enqueued) withdraw would not do. Taking d.mu here also
+// orders the check after the final flush's bookkeeping (flushExportDumpChunk
+// holds d.mu across updateRoutes), so "no dump in flight" guarantees the
+// sent bits the suppression reads already reflect the whole dump.
+func (peer *peer) hasExportDumpInFlight() bool {
+	d := &peer.dump
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.inflight) > 0
+}
+
 // finishExportDump closes out a completed walk: live propagation stops
 // paying the dirty-marking cost and the inflight family debt is cleared.
 func (peer *peer) finishExportDump(gen uint64) {
