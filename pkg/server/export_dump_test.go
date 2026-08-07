@@ -471,6 +471,7 @@ func TestAddPathWithdrawFastSkipNeverAdvertised(t *testing.T) {
 			return nil
 		}, false)
 		require.NoError(t, err)
+		p.abortExportDump()
 		cleanInfiniteChannel(p.fsm.outgoingCh)
 	})
 
@@ -509,7 +510,12 @@ func TestAddPathWithdrawFastSkipNeverAdvertised(t *testing.T) {
 	p.setPathSendMaxFiltered(pathA)
 
 	// Withdraw the never-sent path: the fast skip must produce NO outgoing
-	// traffic and must clear the stale flag.
+	// traffic, must clear the stale flag, and — the part that distinguishes
+	// the fast skip from filterpath's own suppression gate, which is
+	// observationally identical on the wire — must do it WITHOUT entering
+	// filterpath at all (no per-peer clone, no policy walk: the R-230 CPU
+	// win).
+	entriesBefore := s.filterpathEntries.Load()
 	s.propagateUpdate(nil, []*table.Path{makeSourcePath("10.0.0.2", true)})
 	select {
 	case o := <-p.fsm.outgoingCh.Out():
@@ -517,6 +523,8 @@ func TestAddPathWithdrawFastSkipNeverAdvertised(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 	assert.False(t, p.isPathSendMaxFiltered(pathA), "stale send-max flag must be cleared by the fast skip")
+	assert.Equal(t, entriesBefore, s.filterpathEntries.Load(),
+		"the fast skip must suppress without entering filterpath")
 
 	// Withdraw the sent path: same destination, different LocalID — must
 	// still reach the wire.

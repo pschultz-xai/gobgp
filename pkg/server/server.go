@@ -157,6 +157,13 @@ type BgpServer struct {
 	logger       *slog.Logger
 	logLevelVar  *slog.LevelVar
 	timingHook   FSMTimingHook
+	// filterpathEntries counts filterpath invocations. Its only consumer is
+	// the test pinning that the R-230 ADD-PATH withdraw-backfill fast skip
+	// really bypasses filterpath (the skip is observationally identical to
+	// filterpath's own suppression gate by design, so no black-box
+	// assertion can distinguish them). One uncontended atomic add per call
+	// against a pipeline measured at ~6.4µs/path.
+	filterpathEntries atomic.Int64
 	// manage lifecycle of the server
 	isServing     atomic.Bool
 	shutdownWG    *sync.WaitGroup
@@ -713,6 +720,7 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 // its own lock, prePolicyFilterpath reads shard-locked table snapshots, and
 // policy application is read-only against the peer's assignment.
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
+	s.filterpathEntries.Add(1)
 	path, options, stop := s.prePolicyFilterpath(peer, path, old)
 	if stop {
 		return nil
@@ -753,12 +761,13 @@ func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
 	// its send-max flag is dead state whatever the caller — clear it here,
 	// because callers that used to clear it (the ADD-PATH withdraw
 	// backfill) only see the nil. Two deliberate side effects of the nil:
-	// filterpath now mutates peer adv state on suppressed withdraws (the
-	// flag clear — relevant to informational callers like getAdjRibInfo,
-	// which already reached other mutating branches here), and the ranked
-	// exportSelector no longer burns a SendMax/bucket slot on a never-sent
-	// LLGR-stale demotion withdraw (sel.admit never sees it; the freed
-	// slot promotes a real path).
+	// the flag clear is filterpath's first own peer-state mutation, so
+	// informational callers now mutate too (getAdjRibInfo's callback
+	// already mutated send-max flags itself, in
+	// getBestFromLocalCallbackLocked — the precedent is the caller's, not
+	// filterpath's); and the ranked exportSelector no longer burns a
+	// SendMax/bucket slot on a never-sent LLGR-stale demotion withdraw
+	// (sel.admit never sees it; the freed slot promotes a real path).
 	if path != nil && path.IsWithdraw &&
 		!peer.hasExportDumpInFlight() && !peer.hasPathAlreadyBeenSent(path) {
 		peer.unsetPathSendMaxFiltered(path)
@@ -1636,8 +1645,13 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						// safe by the same argument as the check itself
 						// (see hasExportDumpInFlight): a dump starting
 						// after this read snapshots the current RIB, which
-						// already excludes these withdrawn paths.
-						dumpInFlight := targetPeer.hasExportDumpInFlight()
+						// already excludes these withdrawn paths. Only the
+						// non-VRF fast skip consumes it, so VRF peers skip
+						// the read.
+						dumpInFlight := false
+						if peerVrf == "" {
+							dumpInFlight = targetPeer.hasExportDumpInFlight()
+						}
 						for _, d := range dsts {
 							toDelete := d.GetWithdrawnPath()
 							toActuallyDelete := make([]*table.Path, 0, len(toDelete))
