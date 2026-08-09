@@ -541,6 +541,84 @@ func TestAddPathWithdrawFastSkipNeverAdvertised(t *testing.T) {
 	}
 }
 
+// TestExportDumpPrecloneShortCircuitDuringDump pins the R-230 phase-2
+// dump-walk safety claim: the pre-clone reject short-circuit does NOT stand
+// down while a dump walk is in flight (unlike the phase-1 withdraw
+// suppression) because it is return-value-equivalent and side-effect-free —
+// so it must keep firing during the walk (counter) while the walk's fp==nil
+// handling behaves identically. The mutation-killing part is the soft-reset
+// heal withdraw: a previously-sent path the ScopedExport policy now rejects
+// gets its reject verdict FROM the short-circuit, and the walk must still
+// convert that nil into the heal withdraw. A short-circuit that bypassed
+// the walk's fp==nil branch (or a stand-down that reordered verdicts) would
+// drop it.
+func TestExportDumpPrecloneShortCircuitDuringDump(t *testing.T) {
+	s := newExportDumpTestServer(t)
+	t.Cleanup(func() {
+		require.NoError(t, s.StopBgp(context.Background(), &api.StopBgpRequest{}))
+		s.bfdServer.Stop()
+	})
+
+	p := addExportDumpTestPeer(t, s, "10.0.0.1", false)
+	addScopedExportPolicy(t, p, "10.10.10.0/24")
+
+	// RIB: the accepted canary, a previously-sent path the policy now
+	// rejects (simulating the scope tightening after it was advertised),
+	// and a never-sent rejected path.
+	canary := makePath(t, "10.10.10.0/24", "192.0.2.254", 0)
+	sentRejected := makePath(t, "10.99.0.0/24", "192.0.2.254", 0)
+	neverSent := makePath(t, "10.98.0.0/24", "192.0.2.254", 0)
+	s.propagateUpdate(nil, []*table.Path{canary, sentRejected, neverSent})
+	p.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED)
+	p.updateRoutes(sentRejected)
+
+	before := s.precloneRejectSkips.Load()
+	err := s.mgmtOperation(func() error {
+		s.startExportDump(p, exportDumpOpts{
+			families:         []bgp.Family{bgp.RF_IPv4_UC},
+			withdrawFiltered: true,
+		})
+		return nil
+	}, true)
+	require.NoError(t, err)
+
+	// Wait for the walk to finish, then drain everything it enqueued.
+	require.Eventually(t, func() bool { return !p.hasExportDumpInFlight() },
+		10*time.Second, 10*time.Millisecond, "dump walk did not finish")
+	var got []*table.Path
+drain:
+	for {
+		select {
+		case o := <-p.fsm.outgoingCh.Out():
+			msg, ok := o.(*fsmOutgoingMsg)
+			require.True(t, ok)
+			got = append(got, msg.Paths...)
+		case <-time.After(300 * time.Millisecond):
+			break drain
+		}
+	}
+
+	// Exactly two wire actions: the canary announce and the heal withdraw
+	// for the previously-sent now-rejected path. The never-sent rejected
+	// path contributes nothing.
+	require.Len(t, got, 2)
+	byPrefix := map[string]*table.Path{}
+	for _, path := range got {
+		byPrefix[path.GetPrefix()] = path
+	}
+	announce, ok := byPrefix["10.10.10.0/24"]
+	require.True(t, ok, "canary announce missing from the dump")
+	assert.False(t, announce.IsWithdraw)
+	heal, ok := byPrefix["10.99.0.0/24"]
+	require.True(t, ok, "soft-reset heal withdraw missing: the short-circuit's nil must still drive the withdrawFiltered branch")
+	assert.True(t, heal.IsWithdraw)
+
+	// And the verdicts for both rejected candidates came from the
+	// short-circuit — it fired during the walk, no stand-down.
+	assert.GreaterOrEqual(t, s.precloneRejectSkips.Load(), before+2,
+		"short-circuit must keep firing while the dump walk is in flight")
+}
+
 // TestExportDumpLiveUpdatesDuringDumpConverge races live propagation against
 // a running establish dump: whatever the interleaving (dirty-skip before the
 // dump reaches the destination, or fresh update enqueued after a stale
