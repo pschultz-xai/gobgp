@@ -748,6 +748,19 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path, assig
 	// same reason: announce-leg callers only mutate send-max flags on
 	// non-nil filterpath results (sel.admit branches), never on a policy
 	// reject.
+	//
+	// Operational caveat (review round 1, MINOR-4): the prover is
+	// ORDER-DEPENDENT — it aborts at the first non-whitelisted condition
+	// in the shared assignment chain, so the skip only fires while the
+	// ScopedExport gate policies (whitelist-only conditions) sit AHEAD of
+	// any attribute-conditioned policy in the export assignment. If a
+	// future attribute-conditioned policy lands in front of the gate, the
+	// skip silently stops firing fleet-wide; there is no counter metric
+	// to alarm on (precloneRejectSkips is test-only, matching the fork's
+	// filterpathEntries precedent — the fork exports no server counter
+	// metrics), so the signal is the rig's cycle-time telemetry.
+	// TestFilterpathPrecloneSharedGlobalAssignment pins the intended
+	// front-position shape.
 	if assignedExportFollows &&
 		peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, path, options) &&
 		(old == nil || peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, old, options)) {
@@ -1375,7 +1388,11 @@ func (s *BgpServer) sendSecondaryRoutes(peer *peer, newPath *table.Path, dsts []
 
 	f := func(path, old *table.Path) *table.Path {
 		// A rejected stop (R-230 phase-2) is equivalent to ApplyPolicy
-		// below returning nil, which this closure maps to nil too.
+		// below returning nil, which this closure maps to nil too. Note
+		// the short-circuit's old gate is PURELY conservative here: this
+		// closure has no post-policy old-branch (no synthetic withdraw is
+		// derived from 'old'), so gating on old's verdict only makes the
+		// skip engage less often on this path, never incorrectly.
 		path, options, stop, _ := s.prePolicyFilterpath(peer, path, old, true)
 		if stop {
 			return nil

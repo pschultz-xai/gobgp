@@ -1987,6 +1987,195 @@ func TestFilterpathPrecloneRejectShortCircuit(t *testing.T) {
 	assert.Equal(t, gotCtrl.GetNlri().String(), gotScoped.GetNlri().String())
 }
 
+// TestFilterpathPrecloneOldGateAcceptedNonWithdrawOld pins the case where
+// the R-230 phase-2 old gate is genuinely load-bearing: an 'old' that is a
+// live announce (not a withdraw) and that policy ACCEPTS while the new path
+// is provably rejected. Within the prover's whitelist that divergence is
+// reachable through AfiSafiInCondition: for a VRF-attached peer,
+// prePolicyFilterpath ToLocal()s the NEW path (RF_IPv4_VPN -> RF_IPv4_UC)
+// while filterpath's old-branch evaluates 'old' still in VPN space, so an
+// "afi-safi-in [l3vpn-ipv4-unicast] -> accept" statement behind a
+// fail-closed default accepts old and rejects new. The pipeline must emit
+// the synthetic withdraw for old; a short-circuit gating on the new path's
+// verdict alone (or only on old.IsWithdraw — the cheap early-out the
+// existing conservative pin exercises) drops it and leaves a stale route on
+// the peer until the next soft reset. This test hands filterpath the
+// post-ToLocal family split directly. (Adapted from the round-1 review's
+// route-loss reproducer; kills the '(old == nil || !old.IsWithdraw)'
+// mutant that survives the rest of the suite.)
+func TestFilterpathPrecloneOldGateAcceptedNonWithdrawOld(t *testing.T) {
+	rib1 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN})
+	src := newPeerandInfo(t, 1, 2, "192.168.0.1", rib1)
+	rib2 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN})
+	p2 := newPeerandInfo(t, 1, 3, "192.168.0.2", rib2)
+
+	// afi-safi-in [l3vpn-ipv4-unicast] -> accept, fail-closed default.
+	pol, err := table.NewPolicy(oc.PolicyDefinition{
+		Name: "vpn-only",
+		Statements: []oc.Statement{{
+			Name: "accept-vpn",
+			Conditions: oc.Conditions{BgpConditions: oc.BgpConditions{
+				AfiSafiInList: []oc.AfiSafiType{oc.AFI_SAFI_TYPE_L3VPN_IPV4_UNICAST},
+			}},
+			Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_ACCEPT_ROUTE},
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, p2.policy.AddPolicy(pol, false))
+	require.NoError(t, p2.policy.AddPolicyAssignment(p2.TableID(), table.POLICY_DIRECTION_EXPORT,
+		[]*oc.PolicyDefinition{{Name: "vpn-only"}}, table.ROUTE_TYPE_REJECT))
+
+	attrs := func() []bgp.PathAttributeInterface {
+		nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.0.0.9"))
+		require.NoError(t, err)
+		return []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{2})}),
+			nh,
+		}
+	}
+
+	ucNlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.99.0.0/24"))
+	require.NoError(t, err)
+	newPath := table.NewPath(bgp.RF_IPv4_UC, src.peerInfo.Load(), bgp.PathNLRI{NLRI: ucNlri}, false, attrs(), time.Now(), false)
+
+	rd, err := bgp.ParseRouteDistinguisher("100:100")
+	require.NoError(t, err)
+	vpnNlri, err := bgp.NewLabeledVPNIPAddrPrefix(netip.MustParsePrefix("10.99.0.0/24"), *bgp.NewMPLSLabelStack(100), rd)
+	require.NoError(t, err)
+	old := table.NewPath(bgp.RF_IPv4_VPN, src.peerInfo.Load(), bgp.PathNLRI{NLRI: vpnNlri}, false, attrs(), time.Now(), false)
+
+	// old was previously advertised, so the phase-1 never-sent withdraw
+	// suppression must not eat the synthetic withdraw.
+	p2.updateRoutes(old)
+
+	s := NewBgpServer()
+	before := s.precloneRejectSkips.Load()
+	got := s.filterpath(p2, newPath, old)
+	assert.Equal(t, before, s.precloneRejectSkips.Load(),
+		"an accepted non-withdraw old must disengage the short-circuit")
+	require.NotNil(t, got, "ROUTE LOSS: synthetic withdraw for the accepted old was dropped")
+	assert.True(t, got.IsWithdraw)
+}
+
+// TestFilterpathPrecloneSharedGlobalAssignment reproduces the PRODUCTION
+// assignment shape (adapted from the round-1 review): every non-route-server
+// peer shares one RoutingPolicy object keyed by GLOBAL_RIB_NAME, so
+// probe-peer scoping comes from NeighborCondition inside the shared chain,
+// not from per-peer assignments (which is what the other short-circuit tests
+// use). Pins NeighborCondition whitelist coverage, the shared-chain order
+// dependency (the probe reject statement decides BEFORE the prover reaches
+// the attribute-conditioned statement behind it), and that the
+// attribute-conditioned statement still aborts the prover for peers that
+// reach it.
+func TestFilterpathPrecloneSharedGlobalAssignment(t *testing.T) {
+	rib1 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	p1 := newPeerandInfo(t, 1, 2, "192.168.0.1", rib1)
+	rib2 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	probe := newPeerandInfo(t, 1, 3, "192.168.0.2", rib2)
+	rib3 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	normal := newPeerandInfo(t, 1, 3, "192.168.0.3", rib3)
+
+	shared := table.NewRoutingPolicy(logger)
+	require.NoError(t, shared.Reset(&oc.RoutingPolicy{}, nil))
+	probe.policy = shared
+	normal.policy = shared
+	require.Equal(t, table.GLOBAL_RIB_NAME, probe.TableID())
+	require.Equal(t, table.GLOBAL_RIB_NAME, normal.TableID())
+
+	ps, err := table.NewPrefixSet(oc.PrefixSet{
+		PrefixSetName: "canary",
+		PrefixList:    []oc.Prefix{{IpPrefix: netip.MustParsePrefix("10.10.10.0/24")}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, shared.AddDefinedSet(ps, false))
+	ns, err := table.NewNeighborSet(oc.NeighborSet{
+		NeighborSetName:  "probes",
+		NeighborInfoList: []string{"192.168.0.2/32"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, shared.AddDefinedSet(ns, false))
+	cs, err := table.NewCommunitySet(oc.CommunitySet{
+		CommunitySetName: "tagged",
+		CommunityList:    []string{"100:100"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, shared.AddDefinedSet(cs, false))
+
+	pol, err := table.NewPolicy(oc.PolicyDefinition{
+		Name: "scoped",
+		Statements: []oc.Statement{
+			{
+				Name: "probe-canary-accept",
+				Conditions: oc.Conditions{
+					MatchNeighborSet: oc.MatchNeighborSet{NeighborSet: "probes"},
+					MatchPrefixSet:   oc.MatchPrefixSet{PrefixSet: "canary"},
+				},
+				Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_ACCEPT_ROUTE},
+			},
+			{
+				Name: "probe-reject-rest",
+				Conditions: oc.Conditions{
+					MatchNeighborSet: oc.MatchNeighborSet{NeighborSet: "probes"},
+				},
+				Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_REJECT_ROUTE},
+			},
+			{
+				Name: "attr-reject",
+				Conditions: oc.Conditions{
+					BgpConditions: oc.BgpConditions{
+						MatchCommunitySet: oc.MatchCommunitySet{CommunitySet: "tagged"},
+					},
+				},
+				Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_REJECT_ROUTE},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, shared.AddPolicy(pol, false))
+	require.NoError(t, shared.AddPolicyAssignment(table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_EXPORT,
+		[]*oc.PolicyDefinition{{Name: "scoped"}}, table.ROUTE_TYPE_ACCEPT))
+
+	s := NewBgpServer()
+	mk := func(prefix string, tag bool) *table.Path {
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+		require.NoError(t, err)
+		nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.0.0.9"))
+		require.NoError(t, err)
+		pa := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{2})}),
+			nh,
+		}
+		if tag {
+			pa = append(pa, bgp.NewPathAttributeCommunities([]uint32{100<<16 | 100}))
+		}
+		return table.NewPath(bgp.RF_IPv4_UC, p1.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, pa, time.Now(), false)
+	}
+
+	// Probe peer, non-canary: statement 2 rejects on the neighbor match —
+	// provable, short-circuit fires.
+	before := s.precloneRejectSkips.Load()
+	assert.Nil(t, s.filterpath(probe, mk("10.99.0.0/24", false), nil))
+	assert.Equal(t, before+1, s.precloneRejectSkips.Load(), "neighbor-scoped reject must be provable")
+
+	// Probe peer, canary: statement 1 accepts — no skip, real path out.
+	got := s.filterpath(probe, mk("10.10.10.0/24", false), nil)
+	require.NotNil(t, got)
+	assert.Equal(t, before+1, s.precloneRejectSkips.Load())
+
+	// Normal peer, untagged: statements 1/2 miss on neighbor, statement 3
+	// is attribute-conditioned so the prover must abort; default accept.
+	got = s.filterpath(normal, mk("10.99.0.0/24", false), nil)
+	require.NotNil(t, got, "ROUTE LOSS: normal peer path must survive")
+	assert.Equal(t, before+1, s.precloneRejectSkips.Load(),
+		"attribute-conditioned statement must abort the prover")
+
+	// Normal peer, tagged: statement 3 rejects through the full walk only.
+	assert.Nil(t, s.filterpath(normal, mk("10.99.0.0/24", true), nil))
+	assert.Equal(t, before+1, s.precloneRejectSkips.Load())
+}
+
 // TestFilterpathPrecloneShortCircuitAttrDependentPolicy pins constraint 1 of
 // R-230 phase-2: a policy whose match reads attributes the pre-policy clone
 // pipeline can rewrite (here a community set; same class as as-path,

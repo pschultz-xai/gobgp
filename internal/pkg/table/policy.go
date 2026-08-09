@@ -4025,6 +4025,9 @@ func (r *RoutingPolicy) ApplyPolicy(id string, dir PolicyDirection, before *Path
 // section); an assignment swap racing this call and a skipped-or-run real
 // walk is the same race two back-to-back ApplyPolicy calls already have.
 func (r *RoutingPolicy) ProvablyRejectsPreClone(id string, dir PolicyDirection, before *Path, options *PolicyOptions) bool {
+	// Unreachable from the current (only) call site, which never passes a
+	// nil path; kept so the mirror of ApplyPolicy's contract is total —
+	// ApplyPolicy(nil) returns nil, i.e. a provable reject.
 	if before == nil {
 		return true
 	}
