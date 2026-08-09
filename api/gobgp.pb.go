@@ -3830,12 +3830,26 @@ func (*AddPathStreamResponse) Descriptor() ([]byte, []int) {
 }
 
 type GetTableRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TableType     TableType              `protobuf:"varint,1,opt,name=table_type,json=tableType,proto3,enum=api.TableType" json:"table_type,omitempty"`
-	Family        *Family                `protobuf:"bytes,2,opt,name=family,proto3" json:"family,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	TableType TableType              `protobuf:"varint,1,opt,name=table_type,json=tableType,proto3,enum=api.TableType" json:"table_type,omitempty"`
+	Family    *Family                `protobuf:"bytes,2,opt,name=family,proto3" json:"family,omitempty"`
+	Name      string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	// Bendrr fork (R-226): exclude_prefixes names destinations (CIDR form,
+	// exact match — no longest-prefix fallback) whose destination and path
+	// counts are subtracted from the returned summary. The subtraction runs
+	// inside the same serialized management operation as the count itself,
+	// so the result is exact even while the excluded prefixes are being
+	// announced and withdrawn concurrently — the caller-side alternative (a
+	// separate lookup RPC beside the count) races that churn. Prefixes
+	// absent from the table subtract nothing; duplicates (after mask
+	// canonicalization) subtract once. Only supported for GLOBAL and LOCAL
+	// table types and the IPv4/IPv6 UNICAST families; each prefix must
+	// parse and match the requested family. Rebase hazard: field 4 is the
+	// next free tag upstream — if an upstream GetTableRequest ever claims
+	// it, this field must move and the bendrr pin must roll atomically.
+	ExcludePrefixes []string `protobuf:"bytes,4,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GetTableRequest) Reset() {
@@ -3887,6 +3901,13 @@ func (x *GetTableRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *GetTableRequest) GetExcludePrefixes() []string {
+	if x != nil {
+		return x.ExcludePrefixes
+	}
+	return nil
 }
 
 type GetTableResponse struct {
@@ -14710,12 +14731,13 @@ const file_api_gobgp_proto_rawDesc = "" +
 	"table_type\x18\x01 \x01(\x0e2\x0e.api.TableTypeR\ttableType\x12\x15\n" +
 	"\x06vrf_id\x18\x02 \x01(\tR\x05vrfId\x12\x1f\n" +
 	"\x05paths\x18\x03 \x03(\v2\t.api.PathR\x05paths\"\x17\n" +
-	"\x15AddPathStreamResponse\"y\n" +
+	"\x15AddPathStreamResponse\"\xa4\x01\n" +
 	"\x0fGetTableRequest\x12-\n" +
 	"\n" +
 	"table_type\x18\x01 \x01(\x0e2\x0e.api.TableTypeR\ttableType\x12#\n" +
 	"\x06family\x18\x02 \x01(\v2\v.api.FamilyR\x06family\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"y\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12)\n" +
+	"\x10exclude_prefixes\x18\x04 \x03(\tR\x0fexcludePrefixes\"y\n" +
 	"\x10GetTableResponse\x12'\n" +
 	"\x0fnum_destination\x18\x01 \x01(\x04R\x0enumDestination\x12\x19\n" +
 	"\bnum_path\x18\x02 \x01(\x04R\anumPath\x12!\n" +

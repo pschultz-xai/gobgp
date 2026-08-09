@@ -387,6 +387,20 @@ message GetTableRequest {
   TableType table_type = 1;
   Family family = 2;
   string name = 3;
+  // Bendrr fork (R-226): exclude_prefixes names destinations (CIDR form,
+  // exact match — no longest-prefix fallback) whose destination and path
+  // counts are subtracted from the returned summary. The subtraction runs
+  // inside the same serialized management operation as the count itself,
+  // so the result is exact even while the excluded prefixes are being
+  // announced and withdrawn concurrently — the caller-side alternative (a
+  // separate lookup RPC beside the count) races that churn. Prefixes
+  // absent from the table subtract nothing; duplicates (after mask
+  // canonicalization) subtract once. Only supported for GLOBAL and LOCAL
+  // table types and the IPv4/IPv6 UNICAST families; each prefix must
+  // parse and match the requested family. Rebase hazard: field 4 is the
+  // next free tag upstream — if an upstream GetTableRequest ever claims
+  // it, this field must move and the bendrr pin must roll atomically.
+  repeated string exclude_prefixes = 4;
 }
 
 message GetTableResponse {
