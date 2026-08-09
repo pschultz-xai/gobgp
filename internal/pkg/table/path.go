@@ -235,6 +235,57 @@ func UpdatePathAttrs(logger *slog.Logger, global *oc.Global, info *PeerInfo, ori
 	if info.RouteServerClient {
 		return original
 	}
+	// Bendrr (R-256): skip the per-peer attribute rewrite on the withdraw
+	// leg — the withdraw-leg sibling of the R-230 phase-2 announce-leg
+	// pre-clone terminal-reject short-circuit (whose gate sits just above
+	// this function's only production call site in prePolicyFilterpath).
+	// Every attribute this function would build on a withdraw — the
+	// eBGP nexthop/AS_PATH/MED rewrite, the iBGP empty AS_PATH and default
+	// LOCAL_PREF, the route-reflector ORIGINATOR_ID/CLUSTER_LIST — is
+	// provably discarded at pack time: packerV4.add diverts withdraws
+	// before ever reading attributes and packs them as plain
+	// withdrawn-routes NLRI (NewBGPUpdateMessage(nlris, nil, nil)), and
+	// packerMP builds MP_UNREACH_NLRI fresh from family + NLRI. Adv and
+	// send-max bookkeeping key on PathLocalKey only. Precedent for an
+	// unrewritten withdraw traversing the whole pipeline: the synthetic
+	// old-path withdraw built by the METHOD (*BgpServer).filterpath
+	// (old.Clone(true) AFTER prePolicyFilterpath returns) and the
+	// soft-reset heal withdraw in evalExportDumpDest (export_dump.go)
+	// have always reached the packers without passing through this
+	// function. (The free function filterpath's three old.Clone(true)
+	// synthetic withdraws, by contrast, are produced inside
+	// prePolicyFilterpath and DID flow through this rewrite until this
+	// skip.)
+	//
+	// Note the clone is parent-linked: the skip's output carries the
+	// ORIGINAL UNREWRITTEN attributes, not none. The invariant relied on
+	// is "no downstream consumer reads a withdraw's attributes". If that
+	// invariant is broken later, the failure is LEAK-shaped, not
+	// absence-shaped: the consumer would observe the source's nexthop,
+	// no default LOCAL_PREF, MED retained across the eBGP boundary, and
+	// ORIGINATOR_ID/CLUSTER_LIST plus non-transitive unknown attributes
+	// retained even for non-RR-client peers (the rewrite loop below is
+	// what used to strip those). One cosmetic instance exists today:
+	// Path.String() renders the un-rewritten nexthop on the withdraw leg
+	// (log/debug output only).
+	//
+	// The CLONE must stay: downstream mutates the result per peer
+	// (postFilterpath's RemoveLocalPref writes a delPathAttr overlay, and
+	// callers treat the result as peer-owned) — returning the original
+	// would leak one peer's mutations into every other peer's view.
+	// Clone(original.IsWithdraw) preserves the withdraw flag exactly as
+	// the fall-through rewrite path below does.
+	//
+	// Interplay with R-230 phase-1 (never-advertised withdraw
+	// suppression): phase-1's gates DROP withdraws for paths never sent
+	// to the peer; this skip is about the complementary, wire-bound set —
+	// previously-advertised withdraws that phase-1 deliberately lets
+	// through. (Withdraws phase-1 later suppresses also pass through here
+	// first and skip the same wasted rewrite; the two mechanisms compose,
+	// they do not overlap in purpose.)
+	if original.IsWithdraw {
+		return original.Clone(original.IsWithdraw)
+	}
 	path := original.Clone(original.IsWithdraw)
 
 	for _, a := range path.GetPathAttrs() {
