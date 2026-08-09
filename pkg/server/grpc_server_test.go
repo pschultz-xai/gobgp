@@ -267,7 +267,17 @@ func GRPCwaitState(t *testing.T, s api.GoBgpServiceClient, state api.PeerState_S
 				return
 			default:
 				r, err := resp.Recv()
-				assert.NoError(t, err, "failed to receive watch event response")
+				if err != nil {
+					// The watch stream can die mid-test (e.g. a BGP session
+					// flap under load). Surface that as a test failure, not a
+					// nil-dereference panic that kills the whole run.
+					if watchCtx.Err() == nil {
+						t.Errorf("failed to receive watch event response: %v", err)
+						watchCancel()
+						wg.Done()
+					}
+					return
+				}
 
 				if peer := r.GetPeer(); peer != nil {
 					if peer.Type == api.WatchEventResponse_PeerEvent_TYPE_STATE && peer.Peer.State.SessionState == state {
