@@ -24,6 +24,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"testing"
@@ -221,6 +222,21 @@ func TestGRPCBatchApplyVerbs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	defer s.Stop()
+
+	// The gRPC listener binds asynchronously (NewBgpServer starts
+	// apiServer.serve in a goroutine) and unary RPCs fail fast, so under
+	// full-suite parallel load the first AddPaths can dial before the unix
+	// socket exists (observed 2026-08-04; passes 3/3 in isolation). Wait
+	// for the socket to accept before creating the client.
+	sockPath := socketDir + "/gobgp.sock"
+	require.Eventually(t, func() bool {
+		c, err := net.Dial("unix", sockPath)
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "gRPC unix socket %s never came up", sockPath)
 
 	conn, err := grpc.NewClient(socketAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
