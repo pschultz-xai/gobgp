@@ -3975,6 +3975,98 @@ func (r *RoutingPolicy) ApplyPolicy(id string, dir PolicyDirection, before *Path
 	}
 }
 
+// ProvablyRejectsPreClone reports whether ApplyPolicy(id, dir, before,
+// options) is guaranteed to return nil — a terminal reject — decided by a
+// dry-run over the ORIGINAL (pre-clone, pre-mod-action) path. False means
+// "unknown": the caller must run the real pipeline. The dry-run never
+// mutates before and executes no actions.
+//
+// Bendrr (R-230 phase-2): the export announce leg clones every path
+// (UpdatePathAttrs) BEFORE policy evaluation, because an ACCEPT outcome may
+// mutate attributes. A REJECT outcome needs no mutation, so proving the
+// reject up front lets the caller skip the per-path clone and the
+// post-clone policy walk entirely (the scoped-export probe peers reject
+// ~all of a ~15M-path table per cycle; the discarded clones are both direct
+// CPU and GC pressure).
+//
+// Equivalence argument. A verdict is only ever derived from a prefix of the
+// assignment's statement sequence in which every condition belongs to the
+// whitelist below; meeting any other condition type aborts the dry-run with
+// "unknown" before any verdict is claimed. Whitelisted condition Evaluates
+// are pure functions of inputs that are invariant across everything the
+// real pipeline does between here and the real evaluation:
+//
+//   - PrefixCondition reads path.GetFamily() and path.GetNlri().
+//     (*Path).Clone copies the family and resolves the NLRI through the
+//     parent chain to the same root object; UpdatePathAttrs rewrites only
+//     path attributes and nexthop, never NLRI or family.
+//   - NeighborCondition reads options.Info.Address — the same options
+//     object the real ApplyPolicy receives — falling back to
+//     path.GetSource().Address, which is shared through the parent chain
+//     and rewritten by no pipeline step.
+//   - AfiSafiInCondition reads path.GetFamily() only.
+//
+// No modification action (community/ext-community/large-community, MED,
+// local-pref, as-path prepend, nexthop, origin) writes any of those inputs,
+// so a whitelisted statement whose real disposition is ROUTE_TYPE_NONE
+// cannot — via its mod actions — flip a later whitelisted statement's
+// match. Hence the real walk over that same statement prefix computes the
+// identical match sequence on the cloned-and-possibly-modified path and
+// terminates at the same statement with the same disposition.
+//
+// The control-flow mirror of ApplyPolicy is exact: a nil path would return
+// nil (provable), withdraws pass through non-nil (never provable), a
+// matching statement with a nil routing action falls through as
+// ROUTE_TYPE_NONE, a routing action of any type other than *RoutingAction
+// is treated as unknown, and when nothing matches the assignment's default
+// action decides — ApplyPolicy returns nil for anything but an explicit
+// ROUTE_TYPE_ACCEPT, including the no-assignment default of
+// ROUTE_TYPE_NONE. Locking mirrors ApplyPolicy as well (one r.mu read
+// section); an assignment swap racing this call and a skipped-or-run real
+// walk is the same race two back-to-back ApplyPolicy calls already have.
+func (r *RoutingPolicy) ProvablyRejectsPreClone(id string, dir PolicyDirection, before *Path, options *PolicyOptions) bool {
+	if before == nil {
+		return true
+	}
+	if before.IsWithdraw {
+		return false
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, p := range r.getPolicy(id, dir) {
+		for _, stmt := range p.Statements {
+			for _, c := range stmt.Conditions {
+				switch c.(type) {
+				case *PrefixCondition, *NeighborCondition, *AfiSafiInCondition:
+				default:
+					// Condition reads state the clone pipeline or an
+					// earlier mod action can change: no verdict.
+					return false
+				}
+			}
+			if !stmt.Evaluate(before, options) {
+				continue
+			}
+			if stmt.RouteAction == nil || reflect.ValueOf(stmt.RouteAction).IsNil() {
+				// ROUTE_TYPE_NONE: the real walk falls through to the
+				// next statement (mod actions, if any, cannot influence
+				// whitelisted matches — see above).
+				continue
+			}
+			ra, ok := stmt.RouteAction.(*RoutingAction)
+			if !ok {
+				return false
+			}
+			// Terminal disposition at this statement, identical to the
+			// real walk's: reject is provable, accept means no skip.
+			return !ra.AcceptRoute
+		}
+	}
+	return r.getDefaultPolicy(id, dir) != ROUTE_TYPE_ACCEPT
+}
+
 // ApplyPolicyByName applies a single named policy to the path, bypassing the
 // live assignment map. The default action when no statement matches is accept;
 // an empty name accepts unconditionally.
