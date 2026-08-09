@@ -158,6 +158,14 @@ type BgpServer struct {
 	logger        *slog.Logger
 	logLevelVar   *slog.LevelVar
 	timingHook    FSMTimingHook
+	// filterpathEntries counts (*BgpServer).filterpath invocations (the
+	// package-level filterpath helper is not counted). Its only consumer is
+	// the test pinning that the R-230 ADD-PATH withdraw-backfill fast skip
+	// really bypasses filterpath (the skip is observationally identical to
+	// filterpath's own suppression gate by design, so no black-box
+	// assertion can distinguish them). One uncontended atomic add per call
+	// against a pipeline measured at ~6.4µs/path.
+	filterpathEntries atomic.Int64
 	// manage lifecycle of the server
 	isServing     atomic.Bool
 	shutdownWG    *sync.WaitGroup
@@ -715,6 +723,7 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 // its own lock, prePolicyFilterpath reads shard-locked table snapshots, and
 // policy application is read-only against the peer's assignment.
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
+	s.filterpathEntries.Add(1)
 	path, options, stop := s.prePolicyFilterpath(peer, path, old)
 	if stop {
 		return nil
@@ -730,7 +739,45 @@ func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
 		}
 	}
 
-	return s.postFilterpath(peer, path)
+	path = s.postFilterpath(peer, path)
+
+	// Bendrr (R-230): suppress withdraws for paths never advertised to this
+	// peer. Export policy structurally passes withdraws through (ApplyPolicy
+	// returns IsWithdraw paths untouched), so a peer whose export policy
+	// rejected every announce for a destination — the scoped-export probe
+	// peers — otherwise receives the full withdraw stream for routes it
+	// never had. The adv bookkeeping is intent-to-send (updateRoutes runs at
+	// enqueue), so a sent bit is set by the time any withdraw for it can be
+	// computed on the same outgoing channel; the check sits after
+	// postFilterpath so it also covers the synthetic old-path withdraw above
+	// and the LLGR-stale demotion (whose comment already concedes the
+	// never-sent withdraw is unnecessary), and after ToLocal so VRF peers
+	// are keyed in the same space as their bookkeeping. EORs never match:
+	// they are not withdraws. Soft-reset heal withdraws do not pass through
+	// here (export_dump.go gates them on hasPathAlreadyBeenSent itself).
+	// The suppression stands down while a dump walk is in flight: the walk
+	// flushes from a snapshot older than this withdraw, and only an
+	// ENQUEUED live delta claims the destination dirty — suppressing here
+	// would let a stale snapshot entry re-announce the withdrawn path (see
+	// hasExportDumpInFlight for why the check is race-safe against
+	// concurrent dump starts). The suppressed path is leaving the RIB, so
+	// its send-max flag is dead state whatever the caller — clear it here,
+	// because callers that used to clear it (the ADD-PATH withdraw
+	// backfill) only see the nil. Two deliberate side effects of the nil:
+	// the flag clear is filterpath's first own peer-state mutation, so
+	// informational callers now mutate too (getAdjRibInfo's callback
+	// already mutated send-max flags itself, in
+	// getBestFromLocalCallbackLocked — the precedent is the caller's, not
+	// filterpath's); and the ranked exportSelector no longer burns a
+	// SendMax/bucket slot on a never-sent LLGR-stale demotion withdraw
+	// (sel.admit never sees it; the freed slot promotes a real path).
+	if path != nil && path.IsWithdraw &&
+		!peer.hasExportDumpInFlight() && !peer.hasPathAlreadyBeenSent(path) {
+		peer.unsetPathSendMaxFiltered(path)
+		return nil
+	}
+
+	return path
 }
 
 func clonePathList(pathList []*table.Path) []*table.Path {
@@ -1566,9 +1613,8 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 		if source == nil && targetPeer.isRouteServerClient() || source != nil && source.isRouteServerClient() != targetPeer.isRouteServerClient() {
 			continue
 		}
+		peerVrf := targetPeer.fsm.pConf.ReadOnly().Config.Vrf
 		f := func() bgp.Family {
-			conf := targetPeer.fsm.pConf.ReadOnly()
-			peerVrf := conf.Config.Vrf
 			if peerVrf != "" {
 				switch family {
 				case bgp.RF_IPv4_VPN:
@@ -1599,6 +1645,22 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 				if newPath.IsWithdraw {
 					bestList = func() []*table.Path {
 						l := []*table.Path{}
+						// Bendrr (R-230): hoisted out of the per-withdraw
+						// loop — d.mu is a per-peer serialization point
+						// (markExportDumpDirty on every enqueue batch, the
+						// dump flush holds it across updateRoutes), so one
+						// read per peer event, not one per path. Reading a
+						// stale "false" while a dump starts mid-event is
+						// safe by the same argument as the check itself
+						// (see hasExportDumpInFlight): a dump starting
+						// after this read snapshots the current RIB, which
+						// already excludes these withdrawn paths. Only the
+						// non-VRF fast skip consumes it, so VRF peers skip
+						// the read.
+						dumpInFlight := false
+						if peerVrf == "" {
+							dumpInFlight = targetPeer.hasExportDumpInFlight()
+						}
 						for _, d := range dsts {
 							toDelete := d.GetWithdrawnPath()
 							toActuallyDelete := make([]*table.Path, 0, len(toDelete))
@@ -1609,6 +1671,35 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							// below a silent no-op.
 							var lookupPath *table.Path
 							for _, withdrawn := range toDelete {
+								// Bendrr (R-230): never-advertised fast skip.
+								// filterpath below pays the full per-peer
+								// clone + policy walk only for its final
+								// suppression gate to drop the result when
+								// the announce never went to this peer (the
+								// scoped-export probe peers reject all but
+								// the canaries, so on their sessions this is
+								// nearly every withdraw of every cycle).
+								// Global-space keys match the adv bookkeeping
+								// only for non-VRF peers — prePolicyFilterpath
+								// rewrites the rest with ToLocal (the same
+								// trap as the lookupPath note above), and
+								// those fall through to the keyed-correct
+								// gate inside filterpath. Stands down while
+								// a dump walk is in flight, like the
+								// filterpath gate: a suppressed withdraw
+								// claims nothing dirty, so a stale snapshot
+								// flush could re-announce the withdrawn path
+								// AND the R-212 ranked re-sync below would be
+								// skipped. Clearing the send-max flag
+								// preserves the displaced-but-never-sent
+								// bookkeeping cleanup the
+								// unsetPathSendMaxFiltered skip below does
+								// on the slow path.
+								if peerVrf == "" && !dumpInFlight &&
+									!targetPeer.hasPathAlreadyBeenSent(withdrawn) {
+									targetPeer.unsetPathSendMaxFiltered(withdrawn)
+									continue
+								}
 								// if the path is filtered, there is no need to send the withdrawal
 								p := s.filterpath(targetPeer, withdrawn, nil)
 								// the path was never advertized to the peer

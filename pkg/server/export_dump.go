@@ -361,8 +361,18 @@ type exportDumpChunkEntry struct {
 }
 
 // evalExportDumpDest runs one snapshot destination through the export
-// pipeline. It performs no peer state mutation — everything is recorded in
-// the returned entry. ok is false when the destination contributes nothing.
+// pipeline. It records its results in the returned entry rather than
+// mutating peer state, with one exception since R-230: filterpath's
+// suppression gate clears the send-max flag of a suppressed withdraw. That
+// is inert during a normal walk (inflight is set, the gate stands down);
+// in the post-abortExportDump tail — the walk runs up to
+// exportDumpAbortCheckDests destinations before noticing the abort — the
+// gate is live and can delete entries from adv state that
+// resetAdvertisedRoutes just cleared (harmless), or, if the peer
+// re-establishes while the tail is still draining, clear a
+// legitimately-set flag on the new session — the same self-healing class
+// as the "Known benign staleness" note above. ok is false when
+// the destination contributes nothing.
 func (s *BgpServer) evalExportDumpDest(peer *peer, fam *exportDumpFamily, dd exportDumpDest, o exportDumpOpts) (exportDumpChunkEntry, bool) {
 	var e exportDumpChunkEntry
 	haveKey := false
@@ -452,6 +462,55 @@ func (s *BgpServer) flushExportDumpChunk(peer *peer, gen uint64, entries []expor
 	peer.updateRoutes(paths...)
 	sendfsmOutgoingMsg(peer, paths)
 	return len(paths), skipped, true
+}
+
+// hasExportDumpInFlight reports whether a dump walk is currently running.
+// The R-230 never-advertised withdraw suppression must stand down while one
+// is: the walk flushes from a snapshot older than the live withdraw, and the
+// only thing that stops a stale snapshot entry from re-announcing the
+// withdrawn path is the live delta claiming the destination dirty — which a
+// suppressed (never-enqueued) withdraw would not do.
+//
+// Why the check is race-safe: dump starts are NOT serialized with live
+// propagation (handleFSMMessage runs on per-peer FSM goroutines under the
+// mgmt READ lock, concurrently with propagateUpdate). The guarantee is
+// ordering through d.mu plus RIB order instead. A suppression check and
+// startExportDump's inflight install are totally ordered by d.mu; if the
+// check observes "no dump in flight", any dump that starts later snapshots
+// the CURRENT RIB — which already excludes the withdrawn path, because
+// rib.Update ran before the fan-out that is doing the suppressing — so no
+// stale entry containing it can exist. One carve-out: withdraws that
+// filterpath SYNTHESIZES from live paths (the LLGR-stale demotion, and
+// every withdraw derived from 'old' — the rejected-new/accepted-old, RTC
+// constrained-distribution, iBGP-ignore, and AS-loop clones) have no RIB
+// removal behind them, so a later snapshot DOES contain the source path —
+// those are safe for different reasons: the walk calls filterpath with
+// old=nil, so no 'old'-derived clone can be produced from a snapshot
+// entry at all, and the LLGR demotion is re-derived deterministically
+// with inflight set, so the gate stands down and the dump emits at worst
+// a redundant withdraw, never a stale announce. On the finish side,
+// finishExportDump clears inflight in a d.mu critical section after the
+// final flush's updateRoutes (flushExportDumpChunk holds d.mu across it),
+// so "no dump in flight" also guarantees the sent bits the suppression
+// reads reflect the whole dump.
+//
+// Scope caveat: the legacy synchronous secondary-route dump in
+// startExportDump returns before ever setting inflight, so this reads
+// false for its whole duration. That path is excluded from racing the
+// suppression by a different lock — it runs under
+// routeRefreshInProgress.Lock(), against the RLock the fan-out holds
+// across the gate — not by this flag. That exclusion covers only the
+// fan-out; it is sufficient because startExportDump branches on
+// isSecondaryRouteEnabled, so a peer runs either the legacy sync dump or
+// the async walk, never both. The RTC-first synchronous dump is the other
+// inflight-less dump: also safe via routeRefreshInProgress, whose write
+// lock startExportDump's barrier shares, so the async walk cannot
+// snapshot underneath it.
+func (peer *peer) hasExportDumpInFlight() bool {
+	d := &peer.dump
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.inflight) > 0
 }
 
 // finishExportDump closes out a completed walk: live propagation stops

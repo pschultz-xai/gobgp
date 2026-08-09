@@ -1805,7 +1805,86 @@ func TestFilterpathWithRejectPolicy(t *testing.T) {
 		} else {
 			assert.False(t, path2.IsWithdraw)
 		}
+		// Bendrr (R-230): mirror the enqueue bookkeeping the production
+		// callers perform on filterpath's output — the synthetic withdraw
+		// above is only emitted because the previous (accepted) iteration
+		// was recorded as sent.
+		p2.updateRoutes(path2)
 	}
+}
+
+// TestFilterpathSuppressesNeverAdvertisedWithdraw pins the R-230 suppression
+// gate: a withdraw (direct, or synthetic via the policy-rejected 'new' +
+// accepted 'old' shape) for a destination this peer was never sent must come
+// back nil instead of hitting the wire, and a stale send-max flag on the
+// suppressed path must be cleared, not leaked.
+func TestFilterpathSuppressesNeverAdvertisedWithdraw(t *testing.T) {
+	rib1 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	p1 := newPeerandInfo(t, 1, 2, "192.168.0.1", rib1)
+	rib2 := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	p2 := newPeerandInfo(t, 1, 3, "192.168.0.2", rib2)
+	s := NewBgpServer()
+
+	// Export policy on p2 rejecting community 100:100, so a tagged 'new'
+	// path drives filterpath's synthetic old-withdraw branch.
+	comSet, _ := table.NewCommunitySet(oc.CommunitySet{
+		CommunitySetName: "comset1",
+		CommunityList:    []string{"100:100"},
+	})
+	require.NoError(t, p2.policy.AddDefinedSet(comSet, false))
+	policy, _ := table.NewPolicy(oc.PolicyDefinition{
+		Name: "policy1",
+		Statements: []oc.Statement{{
+			Name: "stmt1",
+			Conditions: oc.Conditions{
+				BgpConditions: oc.BgpConditions{
+					MatchCommunitySet: oc.MatchCommunitySet{CommunitySet: "comset1"},
+				},
+			},
+			Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_REJECT_ROUTE},
+		}},
+	})
+	require.NoError(t, p2.policy.AddPolicy(policy, false))
+	require.NoError(t, p2.policy.AddPolicyAssignment(p2.TableID(), table.POLICY_DIRECTION_EXPORT,
+		[]*oc.PolicyDefinition{{Name: "policy1"}}, table.ROUTE_TYPE_ACCEPT))
+
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.20.30.0/24"))
+	pa := []bgp.PathAttributeInterface{bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{1})}), bgp.NewPathAttributeLocalPref(200)}
+	announce := table.NewPath(bgp.RF_IPv4_UC, p1.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, pa, time.Now(), false)
+	paTagged := append(append([]bgp.PathAttributeInterface{}, pa...), bgp.NewPathAttributeCommunities([]uint32{100<<16 | 100}))
+	tagged := table.NewPath(bgp.RF_IPv4_UC, p1.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, paTagged, time.Now(), false)
+	new, _ := process(rib2, []*table.Path{announce})
+	assert.Equal(t, new, announce)
+
+	// Direct withdraw, never advertised: suppressed.
+	withdraw := announce.Clone(true)
+	assert.Nil(t, s.filterpath(p2, withdraw, nil))
+
+	// Synthetic old-withdraw: 'new' rejected by policy, 'old' accepted by
+	// policy but never actually sent — the withdraw the pre-gate code
+	// emitted here goes to a peer that never had the route: suppressed.
+	assert.Nil(t, s.filterpath(p2, tagged, announce))
+
+	// A stale send-max flag on the never-sent path is cleared by the gate.
+	p2.setPathSendMaxFiltered(withdraw)
+	assert.Nil(t, s.filterpath(p2, withdraw, nil))
+	assert.False(t, p2.isPathSendMaxFiltered(withdraw))
+
+	// Once the announce is recorded as sent, both shapes pass again.
+	sent := s.filterpath(p2, announce, nil)
+	assert.NotNil(t, sent)
+	p2.updateRoutes(sent)
+	got := s.filterpath(p2, withdraw, nil)
+	assert.NotNil(t, got)
+	assert.True(t, got.IsWithdraw)
+	synthetic := s.filterpath(p2, tagged, announce)
+	assert.NotNil(t, synthetic)
+	assert.True(t, synthetic.IsWithdraw)
+
+	// And the enqueued withdraw clears the sent bit: the next one is
+	// suppressed again.
+	p2.updateRoutes(got)
+	assert.Nil(t, s.filterpath(p2, withdraw, nil))
 }
 
 func TestPeerGroup(test *testing.T) {
@@ -4025,6 +4104,20 @@ func TestAddDefinedSetReplace(t *testing.T) {
 }
 
 func TestEBGPRouteStuck(test *testing.T) {
+	// macOS only configures 127.0.0.1 on lo0 by default; the rest of 127/8
+	// needs an explicit alias. Probe for the three this test binds and skip
+	// rather than fail on darwin hosts that don't have them (same class as
+	// TestRTCDeferralTimerRaceCondition, Bendrr R-229).
+	if runtime.GOOS == "darwin" {
+		for i := range 3 {
+			addr := fmt.Sprintf("127.0.0.%d", 100+i)
+			l, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
+			if err != nil {
+				test.Skipf("loopback alias %s not present (%v); add it with `sudo ifconfig lo0 alias %s up`", addr, err, addr)
+			}
+			_ = l.Close()
+		}
+	}
 	var peers []*BgpServer
 	for i, s := range []struct {
 		routerId string
