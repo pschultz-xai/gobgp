@@ -166,6 +166,13 @@ type BgpServer struct {
 	// assertion can distinguish them). One uncontended atomic add per call
 	// against a pipeline measured at ~6.4µs/path.
 	filterpathEntries atomic.Int64
+	// precloneRejectSkips counts announce-leg paths whose terminal export
+	// policy reject was proven before the per-path UpdatePathAttrs clone
+	// (the R-230 phase-2 short-circuit in prePolicyFilterpath), skipping
+	// the clone and the post-clone policy walk. Consumed by tests to prove
+	// the skip fires exactly where claimed: terminal-reject peers tick it,
+	// accepting peers and attribute-conditioned policies must not.
+	precloneRejectSkips atomic.Int64
 	// manage lifecycle of the server
 	isServing     atomic.Bool
 	shutdownWG    *sync.WaitGroup
@@ -590,7 +597,23 @@ func filterpath(peer *peer, path, old *table.Path) *table.Path {
 	return path
 }
 
-func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*table.Path, *table.PolicyOptions, bool) {
+// prePolicyFilterpath computes the peer's pre-policy export view of path.
+// stop means the path is not exportable and the caller must not run policy.
+//
+// assignedExportFollows declares that the caller follows a non-stop return
+// with exactly peer.policy.ApplyPolicy(peer.TableID(),
+// POLICY_DIRECTION_EXPORT, ...). It arms the Bendrr R-230 phase-2 pre-clone
+// short-circuit: rejected (which implies stop) reports that the peer's
+// export policy assignment PROVABLY terminally rejects the path, decided
+// without paying the per-path UpdatePathAttrs clone or the post-clone
+// policy walk — under that declaration the proven verdict IS the policy
+// verdict, and rejected lets the informational adj-out caller reproduce the
+// PolicyFiltered bookkeeping that ApplyPolicy's nil produced. Callers that
+// apply anything OTHER than the peer's assigned export policy afterwards —
+// the D-031 would-export shadow evaluator applies a staged named policy
+// precisely because the assigned one is reject-all on the probe peers —
+// must pass false, which disables the short-circuit entirely.
+func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path, assignedExportFollows bool) (_ *table.Path, _ *table.PolicyOptions, stop, rejected bool) {
 	// Special handling for RTM NLRI.
 	if path != nil && path.GetFamily() == bgp.RF_RTC_UC && !path.IsWithdraw {
 		// If the given "path" is locally generated and the same with "old", we
@@ -598,7 +621,7 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 		// infinite UPDATE loop between Route Reflector and its clients.
 		if path.IsLocal() && path.Equal(old) {
 			s.logger.Debug("given rtm nlri is already sent, skipping to advertise", slog.Any("Path", path))
-			return nil, nil, true
+			return nil, nil, true, false
 		}
 
 		if old != nil && old.IsLocal() {
@@ -618,7 +641,7 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 			// paths off the serve loop, so the destination may have been
 			// withdrawn from the live RIB since the snapshot was taken.
 			if dst == nil {
-				return nil, nil, true
+				return nil, nil, true, false
 			}
 			path = nil
 			for _, p := range dst.GetKnownPathList(peer.TableID(), peer.AS()) {
@@ -645,16 +668,16 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 	peerVrf := conf.Config.Vrf
 	if path != nil && peerVrf != "" {
 		if f := path.GetFamily(); f != bgp.RF_IPv4_VPN && f != bgp.RF_IPv6_VPN && f != bgp.RF_FS_IPv4_VPN && f != bgp.RF_FS_IPv6_VPN {
-			return nil, nil, true
+			return nil, nil, true, false
 		}
 		vrf, ok := peer.localRib.GetVrf(peerVrf)
 		if !ok {
-			return nil, nil, true
+			return nil, nil, true, false
 		}
 		if table.CanImportToVrf(vrf, path) {
 			path = path.ToLocal()
 		} else {
-			return nil, nil, true
+			return nil, nil, true, false
 		}
 	}
 
@@ -664,12 +687,12 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 	}
 
 	if path = filterpath(peer, path, old); path == nil {
-		return nil, nil, true
+		return nil, nil, true, false
 	}
 
 	peerInfo := peer.peerInfo.Load()
 	if peerInfo == nil {
-		return nil, nil, true
+		return nil, nil, true, false
 	}
 
 	options := &table.PolicyOptions{
@@ -688,9 +711,68 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 	} else {
 		options.OldNextHop = path.GetNexthop()
 	}
+
+	// Bendrr (R-230 phase-2): pre-clone terminal-reject short-circuit for
+	// the announce leg. UpdatePathAttrs below clones the path because an
+	// ACCEPTING export policy may mutate attributes; a terminal REJECT
+	// needs no mutation, so when the peer's export assignment provably
+	// rejects this path — see RoutingPolicy.ProvablyRejectsPreClone for
+	// the equivalence argument; only NLRI/neighbor/afi-safi-conditioned
+	// assignments with a non-accept outcome qualify, which is exactly the
+	// ScopedExport probe shape (prefix-scoped allows, fail-closed default)
+	// — skip the clone and the post-clone policy walk. The check sits
+	// after ToLocal/ReplaceAS/filterpath so the path is in its final
+	// pre-clone form (the same NLRI space the real walk would match on),
+	// and options.Info is the very object the real walk would receive
+	// (options.Validate is still unset here, but RPKI conditions are
+	// outside the provable whitelist, so no whitelisted Evaluate reads
+	// it). Withdraws are never provable (ApplyPolicy passes them through),
+	// so the phase-1 withdraw gates are untouched.
+	//
+	// 'old' is gated too: filterpath's rejected-new/accepted-old branch
+	// applies export policy to the UNCLONED old and turns a non-nil result
+	// into a synthetic withdraw, so the skip is only claimed when that
+	// branch is provably nil as well. The dry-run sees exactly the input
+	// the real branch would (old is never cloned before that ApplyPolicy
+	// call), and a withdraw 'old' — which ApplyPolicy would pass through,
+	// producing the synthetic withdraw — reports non-provable.
+	//
+	// No dump-walk stand-down is needed, unlike the phase-1 withdraw
+	// suppression: that gate CHANGED filterpath's output (dropping
+	// withdraws the pipeline would emit), while this skip returns exactly
+	// the nil the full pipeline would return and skips no side effect — on
+	// a terminal reject the real pipeline mutates no peer state
+	// (ApplyPolicy is read-only against the assignment, the clone is
+	// garbage, postFilterpath and the withdraw gate never run for the
+	// nil). evalExportDumpDest's fp==nil handling — including the
+	// soft-reset heal withdraw — keys off the nil itself and behaves
+	// identically either way. Send-max accounting is untouched for the
+	// same reason: announce-leg callers only mutate send-max flags on
+	// non-nil filterpath results (sel.admit branches), never on a policy
+	// reject.
+	//
+	// Operational caveat (review round 1, MINOR-4): the prover is
+	// ORDER-DEPENDENT — it aborts at the first non-whitelisted condition
+	// in the shared assignment chain, so the skip only fires while the
+	// ScopedExport gate policies (whitelist-only conditions) sit AHEAD of
+	// any attribute-conditioned policy in the export assignment. If a
+	// future attribute-conditioned policy lands in front of the gate, the
+	// skip silently stops firing fleet-wide; there is no counter metric
+	// to alarm on (precloneRejectSkips is test-only, matching the fork's
+	// filterpathEntries precedent — the fork exports no server counter
+	// metrics), so the signal is the rig's cycle-time telemetry.
+	// TestFilterpathPrecloneSharedGlobalAssignment pins the intended
+	// front-position shape.
+	if assignedExportFollows &&
+		peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, path, options) &&
+		(old == nil || peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, old, options)) {
+		s.precloneRejectSkips.Add(1)
+		return nil, nil, true, true
+	}
+
 	path = table.UpdatePathAttrs(peer.fsm.logger, peer.fsm.gConf, peerInfo, path)
 
-	return path, options, false
+	return path, options, false, false
 }
 
 func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
@@ -724,7 +806,11 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 // policy application is read-only against the peer's assignment.
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
 	s.filterpathEntries.Add(1)
-	path, options, stop := s.prePolicyFilterpath(peer, path, old)
+	// A rejected stop (R-230 phase-2 pre-clone short-circuit) needs no
+	// separate handling here: the proven verdict means ApplyPolicy below
+	// would return nil AND the old-branch would produce no synthetic
+	// withdraw, so nil is exactly what the full pipeline would return.
+	path, options, stop, _ := s.prePolicyFilterpath(peer, path, old, true)
 	if stop {
 		return nil
 	}
@@ -1303,7 +1389,13 @@ func (s *BgpServer) sendSecondaryRoutes(peer *peer, newPath *table.Path, dsts []
 	}
 
 	f := func(path, old *table.Path) *table.Path {
-		path, options, stop := s.prePolicyFilterpath(peer, path, old)
+		// A rejected stop (R-230 phase-2) is equivalent to ApplyPolicy
+		// below returning nil, which this closure maps to nil too. Note
+		// the short-circuit's old gate is PURELY conservative here: this
+		// closure has no post-policy old-branch (no synthetic withdraw is
+		// derived from 'old'), so gating on old's verdict only makes the
+		// skip engage less often on this path, never incorrectly.
+		path, options, stop, _ := s.prePolicyFilterpath(peer, path, old, true)
 		if stop {
 			return nil
 		}
@@ -3382,8 +3474,17 @@ func (s *BgpServer) policyEvaluatedAdjRibOutPaths(peer *peer, family bgp.Family,
 	pathList := make([]*table.Path, 0)
 	for _, path := range s.getPossibleBest(peer, family) {
 		pathLocalKey := path.GetLocalKey()
-		p, options, stop := s.prePolicyFilterpath(peer, path, nil)
+		p, options, stop, rejected := s.prePolicyFilterpath(peer, path, nil, true)
 		if stop {
+			// Bendrr (R-230 phase-2): a rejected stop IS the
+			// policy verdict — reproduce the bookkeeping the
+			// ApplyPolicy nil below performs, so the adj-out
+			// report is identical with and without the
+			// pre-clone short-circuit.
+			if rejected {
+				filtered[pathLocalKey] = table.PolicyFiltered
+				pathList = append(pathList, path)
+			}
 			continue
 		}
 		options.Validate = s.roaTable.Validate
