@@ -231,7 +231,7 @@ func TestGracefulRestartHoldsThenFlushes(t *testing.T) {
 		},
 	}})
 	require.NoError(t, err)
-	establishedA.Wait(t, 10*time.Second)
+	establishedA.Wait(t)
 
 	// Router B: ADD-PATH receiver.
 	routerB := NewBgpServer()
@@ -272,7 +272,7 @@ func TestGracefulRestartHoldsThenFlushes(t *testing.T) {
 		},
 	}})
 	require.NoError(t, err)
-	establishedB.Wait(t, 10*time.Second)
+	establishedB.Wait(t)
 
 	injectLocationCandidate(t, routerA, lmTestPerspective, 1)
 	injectLocationCandidate(t, pod, 30, 2)
