@@ -159,7 +159,7 @@ func startAddPathsExportPair(t *testing.T, addPaths oc.AddPathsConfig, podOpts .
 	established := newPeerStateWaiter(pod, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = router.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(routerNeighbor)})
 	require.NoError(t, err)
-	established.Wait(t, 10*time.Second)
+	established.Wait(t)
 
 	return pod, router
 }
@@ -342,7 +342,7 @@ func TestLocationMetricSendMaxExportsTopRankedInitialDump(t *testing.T) {
 	established := newPeerStateWaiter(pod, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = router.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(routerNeighbor)})
 	require.NoError(t, err)
-	established.Wait(t, 10*time.Second)
+	established.Wait(t)
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		ids := receivedLocationIDs(c, router)

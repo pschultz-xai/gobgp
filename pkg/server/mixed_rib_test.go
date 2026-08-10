@@ -167,7 +167,7 @@ func startMixedRibTopology(t *testing.T, sendMax uint8) (pod, routerA, routerB *
 	establishedA := newPeerStateWaiter(routerA, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = routerA.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(routerANeighbor)})
 	require.NoError(t, err)
-	establishedA.Wait(t, 10*time.Second)
+	establishedA.Wait(t)
 
 	routerB = NewBgpServer()
 	go routerB.Serve()
@@ -210,7 +210,7 @@ func startMixedRibTopology(t *testing.T, sendMax uint8) (pod, routerA, routerB *
 	establishedB := newPeerStateWaiter(routerB, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = routerB.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(routerBNeighbor)})
 	require.NoError(t, err)
-	establishedB.Wait(t, 10*time.Second)
+	establishedB.Wait(t)
 
 	return pod, routerA, routerB
 }

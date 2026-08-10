@@ -312,7 +312,7 @@ func TestWatchUpdateCurrentDeliversInitBeforeLiveEvents(t *testing.T) {
 	established := newPeerStateWaiter(s1, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err := peerServers(t, ctx, []*BgpServer{s1, s2}, []oc.AfiSafiType{oc.AFI_SAFI_TYPE_IPV4_UNICAST})
 	require.NoError(t, err)
-	established.Wait(t, 10*time.Second)
+	established.Wait(t)
 
 	panh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.0.0.1"))
 	attrs := []bgp.PathAttributeInterface{
@@ -694,20 +694,64 @@ func newPeerStateWaiter(s *BgpServer, state api.PeerState_SessionState, expected
 	return w
 }
 
-func (w *peerStateWaiter) Wait(t *testing.T, timeout time.Duration) {
+// peerStateWaitGrace is how long before the BINARY's -timeout deadline Wait
+// gives up, so a genuinely unreached state fails with Wait's message instead
+// of (only) the go-test timeout panic traceback.
+const peerStateWaitGrace = 10 * time.Second
+
+// peerStateWaitFloor is the least Wait will ever wait — the pre-R-219 fixed
+// budget — even when the binary deadline is nearer than the grace period
+// (a short -timeout run is about to panic anyway; failing every Wait
+// instantly with a negative budget would only add noise).
+const peerStateWaitFloor = 10 * time.Second
+
+// peerStateWaitCap bounds any single Wait. t.Deadline is the BINARY's
+// -timeout deadline, shared by every test in the package run, so an
+// uncapped budget would let one genuinely unreachable state consume nearly
+// the whole shared allowance and cascade bogus failures into every later
+// Wait. 90s is 9x the budget that flaked under load and well under the 10m
+// default -timeout for this ~220s package.
+const peerStateWaitCap = 90 * time.Second
+
+// Wait blocks until the watched state change arrives, deriving its budget
+// from the remaining shared -timeout allowance, clamped to
+// [peerStateWaitFloor, peerStateWaitCap], instead of a fixed caller-chosen
+// timeout. Under full-suite load the old fixed 10s regularly expired while
+// the loaded host was still converging — seven such failures in one run,
+// none reproducible solo (Bendrr R-219). R-229 hardened GRPCwaitState
+// (grpc_server_test.go) against the sibling nil-deref failure mode, but
+// that helper still hands callers an UNBOUNDED WaitGroup wait — the cap
+// rationale above applies to it too; bounding it is a separate concern
+// this change does not take on. A passing wait is event-driven and
+// returns as soon as the state is reached, so the larger budget costs
+// healthy runs nothing.
+func (w *peerStateWaiter) Wait(t *testing.T) {
 	t.Helper()
+	timeout := peerStateWaitCap
+	if deadline, ok := t.Deadline(); ok {
+		timeout = min(peerStateWaitCap, max(time.Until(deadline)-peerStateWaitGrace, peerStateWaitFloor))
+	}
 	select {
 	case <-w.doneCh:
 		return
 	case <-time.After(timeout):
+		// doneCh may have become ready while the timer fired; don't report
+		// a reached state as a failure. This narrows the race, it does not
+		// close it: finish() cancels the watch before closing doneCh, so a
+		// timer firing between those two statements can still be reported.
+		select {
+		case <-w.doneCh:
+			return
+		default:
+		}
 		w.cancel()
 		t.Fatalf("failed to reach state %v within %s", w.state, timeout)
 	}
 }
 
-func waitPeerState(t *testing.T, s *BgpServer, state api.PeerState_SessionState, timeout time.Duration, expectedFamilies ...bgp.Family) {
+func waitPeerState(t *testing.T, s *BgpServer, state api.PeerState_SessionState, expectedFamilies ...bgp.Family) {
 	t.Helper()
-	newPeerStateWaiter(s, state, expectedFamilies...).Wait(t, timeout)
+	newPeerStateWaiter(s, state, expectedFamilies...).Wait(t)
 }
 
 func TestListPathEnableFiltered(test *testing.T) {
@@ -771,7 +815,7 @@ func TestListPathEnableFiltered(test *testing.T) {
 	err = server2.AddPeer(context.Background(), &api.AddPeerRequest{Peer: peer2})
 	assert.NoError(err)
 
-	establishedWaiter.Wait(test, 10*time.Second)
+	establishedWaiter.Wait(test)
 
 	// Add IMPORT policy at server1 for rejecting 10.1.0.0/24
 	d1 := &api.DefinedSet{
@@ -1449,7 +1493,7 @@ func TestMonitor(test *testing.T) {
 	err = t.AddPeer(context.Background(), &api.AddPeerRequest{Peer: p2})
 	assert.NoError(err)
 
-	establishedWaiter.Wait(test, 10*time.Second)
+	establishedWaiter.Wait(test)
 
 	// Test WatchBestPath.
 	w, err := s.watch(WatchBestPath(false))
@@ -2348,7 +2392,7 @@ func TestPeerGroup(test *testing.T) {
 	err = t.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(m)})
 	assert.NoError(err)
 
-	establishedWaiter.Wait(test, 10*time.Second)
+	establishedWaiter.Wait(test)
 }
 
 func TestDynamicNeighbor(t *testing.T) {
@@ -2419,7 +2463,7 @@ func TestDynamicNeighbor(t *testing.T) {
 	err = s2.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(m)})
 	assert.NoError(err)
 
-	establisedWaiter.Wait(t, 10*time.Second)
+	establisedWaiter.Wait(t)
 }
 
 // TestDynamicNeighborUnknownPeerGroup verifies that the dynamic neighbor API rejects a peer group
@@ -2549,7 +2593,7 @@ func TestDynamicNeighborBfd(t *testing.T) {
 	waiter := newPeerStateWaiter(s2, api.PeerState_SESSION_STATE_ESTABLISHED)
 	err = s2.AddPeer(context.Background(), &api.AddPeerRequest{Peer: oc.NewPeerFromConfigStruct(m)})
 	assert.NoError(err)
-	waiter.Wait(t, 10*time.Second)
+	waiter.Wait(t)
 
 	countBfd := func() int {
 		count := 0
@@ -2658,7 +2702,7 @@ func TestGracefulRestartTimerExpired(t *testing.T) {
 	err = s2.AddPeer(context.Background(), &api.AddPeerRequest{Peer: p2})
 	assert.NoError(t, err)
 
-	establishedWaiter.Wait(t, 10*time.Second)
+	establishedWaiter.Wait(t)
 
 	// Force TCP session disconnected in order to cause Graceful Restart at s1
 	// side.
@@ -2748,7 +2792,7 @@ func TestTcpConnectionClosedAfterPeerDel(t *testing.T) {
 	err = s1.AddPeer(context.Background(), &api.AddPeerRequest{Peer: p1})
 	assert.NoError(err)
 
-	activeWaiter.Wait(t, 10*time.Second)
+	activeWaiter.Wait(t)
 
 	// We delete the peer incoming channel from the server list so that we can
 	// intercept the transition from ACTIVE state to OPENSENT state.
@@ -2823,7 +2867,7 @@ func TestTcpConnectionClosedAfterPeerDel(t *testing.T) {
 	err = s1.AddPeer(context.Background(), &api.AddPeerRequest{Peer: p1})
 	assert.NoError(err)
 
-	establishedWaiter.Wait(t, 10*time.Second)
+	establishedWaiter.Wait(t)
 }
 
 func TestFamiliesForSoftreset(t *testing.T) {
@@ -4192,7 +4236,7 @@ func TestRTCDefferalTime(test *testing.T) {
 	defer receiver.DeletePeer(ctx, &api.DeletePeerRequest{
 		Address: "127.0.0.1",
 	})
-	establishedSender.Wait(test, 10*time.Second)
+	establishedSender.Wait(test)
 
 	watcher, err := receiver.watch(WatchUpdate(true, "", ""), WatchEor(true))
 	require.NoError(test, err)
@@ -4397,7 +4441,7 @@ func TestWatchEvent(test *testing.T) {
 
 	err = t.AddPeer(context.Background(), &api.AddPeerRequest{Peer: peer2})
 	assert.NoError(err)
-	watchers.Wait(test, 10*time.Second)
+	watchers.Wait(test)
 
 	var count atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4534,9 +4578,9 @@ func TestEBGPRouteStuck(test *testing.T) {
 		}
 	}
 
-	wg.Wait(test, 10*time.Second)
-	wg1.Wait(test, 10*time.Second)
-	wg2.Wait(test, 10*time.Second)
+	wg.Wait(test)
+	wg1.Wait(test)
+	wg2.Wait(test)
 
 	family4 := &api.Family{
 		Afi:  api.Family_AFI_IP,
@@ -4785,7 +4829,7 @@ func TestRTCDeferralTimerRaceCondition(t *testing.T) {
 		Peer: oc.NewPeerFromConfigStruct(neighbor),
 	})
 	require.NoError(t, err)
-	wg.Wait(t, 10*time.Second)
+	wg.Wait(t)
 
 	m := NewMockConnection()
 	m.SetRemoteAddr(peerAddr)
@@ -4823,7 +4867,7 @@ func TestRTCDeferralTimerRaceCondition(t *testing.T) {
 	m.PushBgpMessage(openMsg)
 	m.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
 
-	wgEstablished.Wait(t, 10*time.Second)
+	wgEstablished.Wait(t)
 
 	peer := s.neighborMap[peerAddrParsed]
 
@@ -4959,7 +5003,7 @@ func TestRTCDeferralTimerStaleProtection(t *testing.T) {
 		Peer: oc.NewPeerFromConfigStruct(neighbor),
 	})
 	require.NoError(t, err)
-	wg.Wait(t, 10*time.Second)
+	wg.Wait(t)
 
 	peerAddrParsed := netip.MustParseAddr(peerAddr)
 	peer := s.neighborMap[peerAddrParsed]
@@ -4988,7 +5032,7 @@ func TestRTCDeferralTimerStaleProtection(t *testing.T) {
 	m1.PushBgpMessage(openMsg1)
 	m1.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
 
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, 10*time.Second, bgp.RF_RTC_UC, bgp.RF_IPv4_VPN)
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, bgp.RF_RTC_UC, bgp.RF_IPv4_VPN)
 
 	conf := peer.fsm.pConf.ReadOnly()
 	downtimeAfterFirstEstablished := conf.Timers.State.Downtime
@@ -5004,7 +5048,7 @@ func TestRTCDeferralTimerStaleProtection(t *testing.T) {
 		return downtime > downtimeAfterFirstEstablished
 	}, 10*time.Second, 10*time.Millisecond, "Downtime should be updated after PeerDown")
 
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE)
 
 	conf = peer.fsm.pConf.ReadOnly()
 	downtimeAfterDown := conf.Timers.State.Downtime
@@ -5021,7 +5065,7 @@ func TestRTCDeferralTimerStaleProtection(t *testing.T) {
 	m2.PushBgpMessage(openMsg2)
 	m2.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
 
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, 10*time.Second, bgp.RF_RTC_UC, bgp.RF_IPv4_VPN)
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, bgp.RF_RTC_UC, bgp.RF_IPv4_VPN)
 
 	conf = peer.fsm.pConf.ReadOnly()
 	downtimeAfterSecondEstablished := conf.Timers.State.Downtime
@@ -5127,7 +5171,7 @@ func TestRTCImplicitWithdrawForAcceptedPathWillWithdrawVPNPaths(t *testing.T) {
 	if err := peerServers(t, ctx, []*BgpServer{s1, s2}, []oc.AfiSafiType{oc.AFI_SAFI_TYPE_L3VPN_IPV4_UNICAST, oc.AFI_SAFI_TYPE_RTC}); err != nil {
 		t.Fatal(err)
 	}
-	wgEstablished.Wait(t, 10*time.Second)
+	wgEstablished.Wait(t)
 	// Add import policy on s1: reject RTC routes with AS_PATH length >= 1.
 	stmt := &api.Statement{
 		Name: "reject_as_path",
@@ -5220,7 +5264,7 @@ func TestRTCShouldNotAdvertiseVPNRouteWhenRTCIsNotPassImportPolicies(t *testing.
 	if err := peerServers(t, ctx, []*BgpServer{s1, s2}, []oc.AfiSafiType{oc.AFI_SAFI_TYPE_L3VPN_IPV4_UNICAST, oc.AFI_SAFI_TYPE_RTC}); err != nil {
 		t.Fatal(err)
 	}
-	wgEstablished.Wait(t, 10*time.Second)
+	wgEstablished.Wait(t)
 	// Add import policy on s1: reject RTC routes with AS_PATH length >= 1.
 	stmt := &api.Statement{
 		Name: "reject_as_path",
