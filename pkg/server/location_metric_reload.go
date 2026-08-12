@@ -204,7 +204,10 @@ func (s *BgpServer) propagateReRankedDestinations(dsts []*table.Update, stats *L
 					}
 				}
 				if targetPeer.isAddPathSendEnabled(f) {
-					paths = append(paths, s.syncRankedAddPathSetFromList(targetPeer, f, u.KnownPathList, nil)...)
+					// armPreclone=true: no hoisted destination-level dry-run
+					// runs on this leg, so the per-path phase-2 short-circuit
+					// stays armed.
+					paths = append(paths, s.syncRankedAddPathSetFromList(targetPeer, f, u.KnownPathList, nil, true)...)
 				} else {
 					plainBest = append(plainBest, gBestList[i])
 					plainOld = append(plainOld, gOldList[i])

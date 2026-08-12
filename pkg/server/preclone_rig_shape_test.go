@@ -59,6 +59,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -123,32 +124,19 @@ func rigScopePrefixes() []*api.Prefix {
 	return out
 }
 
-func TestFilterpathPrecloneRigScopedExportShape(t *testing.T) {
-	// Session shape: one source peer, one probe peer (rig convention:
-	// 127/8 loopback), one inventory router, plus an out-of-inventory
-	// stranger for the guard leg. Probe and router share ONE
-	// RoutingPolicy under GLOBAL_RIB_NAME — the production topology (the
-	// gate rides the global export assignment; bendrr export.go:65-67).
-	ribSrc := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	src := newPeerandInfo(t, 1, 2, "10.0.0.7", ribSrc)
-	ribProbe := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	probe := newPeerandInfo(t, 1, 3, "127.0.1.1", ribProbe)
-	ribRouter := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	router := newPeerandInfo(t, 1, 3, "10.0.0.2", ribRouter)
-	ribStranger := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	stranger := newPeerandInfo(t, 1, 3, "10.9.9.9", ribStranger)
-
-	shared := table.NewRoutingPolicy(logger)
-	require.NoError(t, shared.Reset(&oc.RoutingPolicy{}, nil))
-	probe.policy = shared
-	router.policy = shared
-	stranger.policy = shared
-	require.Equal(t, table.GLOBAL_RIB_NAME, probe.TableID())
-
-	// Defined sets, exactly as ConfigureExportGate sends them
-	// (export.go:355-450: single-address prefix form for neighbors;
-	// masked prefixes with min=bits / max=32 for the widened scope), fed
-	// through the fork's OWN AddDefinedSet conversion.
+// installRigScopedExportGate installs the byte-faithful rig-rendered gate
+// on shared, exactly as ConfigureExportGate sends it:
+//
+//   - defined sets (export.go:355-450: single-address prefix form for
+//     neighbors; masked prefixes with min=bits / max=32 for the widened
+//     scope), fed through the fork's OWN AddDefinedSet conversion;
+//   - policies, exactly as desiredGatePolicies (export.go:154-183) and
+//     scopedExportPolicy (export.go:193-223) render them, fed through the
+//     fork's OWN AddPolicy conversion;
+//   - wire-test/active assignment order and fail-closed default
+//     (export.go:884-886, 974-984).
+func installRigScopedExportGate(tb testing.TB, shared *table.RoutingPolicy) {
+	tb.Helper()
 	for _, ds := range []*api.DefinedSet{
 		{
 			DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR,
@@ -167,13 +155,10 @@ func TestFilterpathPrecloneRigScopedExportShape(t *testing.T) {
 		},
 	} {
 		set, err := newDefinedSetFromApiStruct(ds)
-		require.NoError(t, err)
-		require.NoError(t, shared.AddDefinedSet(set, false))
+		require.NoError(tb, err)
+		require.NoError(tb, shared.AddDefinedSet(set, false))
 	}
 
-	// Policies, exactly as desiredGatePolicies (export.go:154-183) and
-	// scopedExportPolicy (export.go:193-223) render them, fed through the
-	// fork's OWN AddPolicy conversion.
 	for _, pol := range []*api.Policy{
 		{
 			Name: "bendrr-export-gate-guard",
@@ -217,19 +202,42 @@ func TestFilterpathPrecloneRigScopedExportShape(t *testing.T) {
 		},
 	} {
 		p, err := newPolicyFromApiStruct(pol)
-		require.NoError(t, err)
-		require.NoError(t, shared.AddPolicy(p, false))
+		require.NoError(tb, err)
+		require.NoError(tb, shared.AddPolicy(p, false))
 	}
 
-	// Wire-test/active assignment order and fail-closed default
-	// (export.go:884-886, 974-984).
-	require.NoError(t, shared.AddPolicyAssignment(table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_EXPORT,
+	require.NoError(tb, shared.AddPolicyAssignment(table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_EXPORT,
 		[]*oc.PolicyDefinition{
 			{Name: "bendrr-export-gate-guard"},
 			{Name: "bendrr-export-scope"},
 			{Name: "bendrr-export-gate-allow"},
 		},
 		table.ROUTE_TYPE_REJECT))
+}
+
+func TestFilterpathPrecloneRigScopedExportShape(t *testing.T) {
+	// Session shape: one source peer, one probe peer (rig convention:
+	// 127/8 loopback), one inventory router, plus an out-of-inventory
+	// stranger for the guard leg. Probe and router share ONE
+	// RoutingPolicy under GLOBAL_RIB_NAME — the production topology (the
+	// gate rides the global export assignment; bendrr export.go:65-67).
+	ribSrc := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	src := newPeerandInfo(t, 1, 2, "10.0.0.7", ribSrc)
+	ribProbe := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	probe := newPeerandInfo(t, 1, 3, "127.0.1.1", ribProbe)
+	ribRouter := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	router := newPeerandInfo(t, 1, 3, "10.0.0.2", ribRouter)
+	ribStranger := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	stranger := newPeerandInfo(t, 1, 3, "10.9.9.9", ribStranger)
+
+	shared := table.NewRoutingPolicy(logger)
+	require.NoError(t, shared.Reset(&oc.RoutingPolicy{}, nil))
+	probe.policy = shared
+	router.policy = shared
+	stranger.policy = shared
+	require.Equal(t, table.GLOBAL_RIB_NAME, probe.TableID())
+
+	installRigScopedExportGate(t, shared)
 
 	s := NewBgpServer()
 	mk := func(prefix string) *table.Path {
@@ -306,6 +314,120 @@ func TestFilterpathPrecloneRigScopedExportShape(t *testing.T) {
 		"withdraw leg must not engage the announce-leg short-circuit")
 }
 
+// TestSyncRankedAddPathSetHoistedSkipRigShape (Bendrr R-230 phase-3) pins
+// the prover-based reject skip hoisted ABOVE the per-update ADD-PATH
+// ranked-set sync bookkeeping, on the same byte-faithful rig-rendered gate
+// shape:
+//
+//   - a non-canary restore announce toward the probe peer performs NO
+//     destination lookup and NO known-path-list evaluation: the nil-rib
+//     call nil-panics inside GetDestination if the skip regresses, and a
+//     stable filterpathEntries pins that the sync loop never ran (counter
+//     seams only — test-only observability, the documented stance at
+//     prePolicyFilterpath);
+//   - the exact canary /24 still syncs and announces through the full
+//     bookkeeping (the nightly latency probe's accepted leg);
+//   - the accepting inventory router runs the full loop, paying only the
+//     hoisted dry-run;
+//   - a VRF-attached peer falls through entirely — the prover would
+//     dry-run the global NLRI space while the real walk evaluates the
+//     ToLocal rewrite (the same keying trap as the phase-1 site's
+//     lookupPath note).
+func TestSyncRankedAddPathSetHoistedSkipRigShape(t *testing.T) {
+	rib := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	src := newPeerandInfo(t, 1, 2, "10.0.0.7", rib)
+	probe := newPeerandInfo(t, 1, 3, "127.0.1.1", rib)
+	router := newPeerandInfo(t, 1, 3, "10.0.0.2", rib)
+
+	shared := table.NewRoutingPolicy(logger)
+	require.NoError(t, shared.Reset(&oc.RoutingPolicy{}, nil))
+	probe.policy = shared
+	router.policy = shared
+	installRigScopedExportGate(t, shared)
+
+	// Send-only ADD-PATH toward the probe (bendrr rig/procs.go:344-354);
+	// the router gets the same mode so both legs exercise the wrapper.
+	for _, p := range []*peer{probe, router} {
+		p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{
+			bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND,
+		})
+	}
+
+	s := NewBgpServer()
+	mk := func(prefix string) *table.Path {
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+		require.NoError(t, err)
+		nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.0.0.9"))
+		require.NoError(t, err)
+		pa := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{2})}),
+			nh,
+		}
+		return table.NewPath(bgp.RF_IPv4_UC, src.peerInfo.Load(), bgp.PathNLRI{NLRI: nlri}, false, pa, time.Now(), false)
+	}
+
+	// The non-canary destination EXISTS in the table, so the empty result
+	// below comes from the hoisted skip, not from a dest==nil early out.
+	nonCanary := mk("100.64.12.0/24")
+	rib.Update(nonCanary)
+
+	skipsBefore := s.precloneSyncSkips.Load()
+	entriesBefore := s.filterpathEntries.Load()
+	assert.Empty(t, s.syncRankedAddPathSet(rib, probe, bgp.RF_IPv4_UC, nonCanary, ""),
+		"probe non-canary announce must sync to nothing")
+	assert.Equal(t, skipsBefore+1, s.precloneSyncSkips.Load(),
+		"the hoisted skip must fire on the rig-rendered (masklength-range) shape")
+	assert.Equal(t, entriesBefore, s.filterpathEntries.Load(),
+		"the hoisted skip must not run the sync loop (no per-path filterpath)")
+	assert.False(t, probe.hasPathAlreadyBeenSent(nonCanary))
+	assert.False(t, probe.isPathSendMaxFiltered(nonCanary),
+		"the skipped sync must leave no send-max bookkeeping behind")
+
+	// Hard no-lookup seam: with a nil table manager, any destination
+	// lookup nil-panics — returning cleanly proves the skip decides
+	// BEFORE GetDestination.
+	assert.Empty(t, s.syncRankedAddPathSet(nil, probe, bgp.RF_IPv4_UC, nonCanary, ""))
+	assert.Equal(t, skipsBefore+2, s.precloneSyncSkips.Load())
+
+	// Exact canary /24: never provable, full bookkeeping, announced.
+	canary := mk("198.18.3.0/24")
+	rib.Update(canary)
+	got := s.syncRankedAddPathSet(rib, probe, bgp.RF_IPv4_UC, canary, "")
+	require.Len(t, got, 1, "ROUTE LOSS: exact canary /24 must still sync and announce to the probe peer")
+	assert.False(t, got[0].IsWithdraw)
+	assert.Equal(t, canary.GetLocalKey(), got[0].GetLocalKey())
+	probe.updateRoutes(got...) // as the propagateUpdateToNeighbors call site does
+	assert.True(t, probe.hasPathAlreadyBeenSent(canary))
+	assert.Equal(t, skipsBefore+2, s.precloneSyncSkips.Load(),
+		"the accepted canary must not tick the sync-skip counter")
+
+	// Inventory router: scope statements miss on neighbor, the trailing
+	// allow accepts — not provable, the full loop runs and announces.
+	entriesBefore = s.filterpathEntries.Load()
+	got = s.syncRankedAddPathSet(rib, router, bgp.RF_IPv4_UC, nonCanary, "")
+	require.Len(t, got, 1, "ROUTE LOSS: inventory router must keep the full export")
+	assert.Greater(t, s.filterpathEntries.Load(), entriesBefore,
+		"the router leg must run the real sync loop")
+	assert.Equal(t, skipsBefore+2, s.precloneSyncSkips.Load())
+
+	// VRF-attached peer: must fall through the gate (no skip tick) even
+	// though the assignment provably rejects in the GLOBAL NLRI space.
+	vrfPeer := newPeerandInfo(t, 1, 3, "127.0.2.1", rib)
+	vrfPeer.policy = shared
+	vrfPeer.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{
+		bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND,
+	})
+	vrfPeer.fsm.lock.Lock()
+	vrfConf := vrfPeer.fsm.pConf.ReadCopy()
+	vrfConf.Config.Vrf = "vrf-red"
+	vrfPeer.fsm.pConf.Update(&vrfConf)
+	vrfPeer.fsm.lock.Unlock()
+	assert.Empty(t, s.syncRankedAddPathSet(rib, vrfPeer, bgp.RF_IPv4_UC, nonCanary, "vrf-red"))
+	assert.Equal(t, skipsBefore+2, s.precloneSyncSkips.Load(),
+		"VRF peers must not engage the hoisted skip (ToLocal keys a different NLRI space)")
+}
+
 // BenchmarkPrecloneRigShapeResidual measures what a probe peer's announce
 // leg still costs PER PATH with the phase-2 short-circuit firing, on the
 // exact rig-rendered gate shape. BenchmarkPrecloneGateChain (table pkg)
@@ -321,13 +443,15 @@ func TestFilterpathPrecloneRigScopedExportShape(t *testing.T) {
 // any of this, which is consistent with the rig reading (withdraw
 // parity, restore-only ~2x adder).
 func BenchmarkPrecloneRigShapeResidual(b *testing.B) {
-	t := &testing.T{}
+	// The fixture builders take the *testing.B directly (review round 1,
+	// minor-9): the earlier zero-value &testing.T{} stand-in swallowed
+	// assertion failures silently.
 	ribSrc := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	src := newPeerandInfo(t, 1, 2, "10.0.0.7", ribSrc)
+	src := newPeerandInfo(b, 1, 2, "10.0.0.7", ribSrc)
 	ribProbe := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	probe := newPeerandInfo(t, 1, 3, "127.0.1.1", ribProbe)
+	probe := newPeerandInfo(b, 1, 3, "127.0.1.1", ribProbe)
 	ribRouter := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
-	router := newPeerandInfo(t, 1, 3, "10.0.0.2", ribRouter)
+	router := newPeerandInfo(b, 1, 3, "10.0.0.2", ribRouter)
 
 	shared := table.NewRoutingPolicy(logger)
 	if err := shared.Reset(&oc.RoutingPolicy{}, nil); err != nil {
@@ -336,90 +460,7 @@ func BenchmarkPrecloneRigShapeResidual(b *testing.B) {
 	probe.policy = shared
 	router.policy = shared
 
-	for _, ds := range []*api.DefinedSet{
-		{
-			DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR,
-			Name:        "bendrr-router-neighbors",
-			List:        []string{"10.0.0.2/32", "127.0.1.1/32"},
-		},
-		{
-			DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR,
-			Name:        "bendrr-export-scope-neighbors",
-			List:        []string{"127.0.1.1/32"},
-		},
-		{
-			DefinedType: api.DefinedType_DEFINED_TYPE_PREFIX,
-			Name:        "bendrr-export-scope-prefixes",
-			Prefixes:    rigScopePrefixes(),
-		},
-	} {
-		set, err := newDefinedSetFromApiStruct(ds)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if err := shared.AddDefinedSet(set, false); err != nil {
-			b.Fatal(err)
-		}
-	}
-	for _, pol := range []*api.Policy{
-		{
-			Name: "bendrr-export-gate-guard",
-			Statements: []*api.Statement{rigGateStatement(
-				"bendrr-export-gate-reject-unknown",
-				&api.Conditions{NeighborSet: &api.MatchSet{
-					Type: api.MatchSet_TYPE_INVERT, Name: "bendrr-router-neighbors",
-				}},
-				&api.Actions{RouteAction: api.RouteAction_ROUTE_ACTION_REJECT},
-			)},
-		},
-		{
-			Name: "bendrr-export-scope",
-			Statements: []*api.Statement{
-				rigGateStatement(
-					"bendrr-export-scope-accept",
-					&api.Conditions{
-						NeighborSet: &api.MatchSet{Type: api.MatchSet_TYPE_ANY, Name: "bendrr-export-scope-neighbors"},
-						PrefixSet:   &api.MatchSet{Type: api.MatchSet_TYPE_ANY, Name: "bendrr-export-scope-prefixes"},
-					},
-					&api.Actions{RouteAction: api.RouteAction_ROUTE_ACTION_ACCEPT},
-				),
-				rigGateStatement(
-					"bendrr-export-scope-reject",
-					&api.Conditions{
-						NeighborSet: &api.MatchSet{Type: api.MatchSet_TYPE_ANY, Name: "bendrr-export-scope-neighbors"},
-					},
-					&api.Actions{RouteAction: api.RouteAction_ROUTE_ACTION_REJECT},
-				),
-			},
-		},
-		{
-			Name: "bendrr-export-gate-allow",
-			Statements: []*api.Statement{rigGateStatement(
-				"bendrr-export-gate-allow-routers",
-				&api.Conditions{NeighborSet: &api.MatchSet{
-					Type: api.MatchSet_TYPE_ANY, Name: "bendrr-router-neighbors",
-				}},
-				&api.Actions{RouteAction: api.RouteAction_ROUTE_ACTION_ACCEPT},
-			)},
-		},
-	} {
-		p, err := newPolicyFromApiStruct(pol)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if err := shared.AddPolicy(p, false); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := shared.AddPolicyAssignment(table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_EXPORT,
-		[]*oc.PolicyDefinition{
-			{Name: "bendrr-export-gate-guard"},
-			{Name: "bendrr-export-scope"},
-			{Name: "bendrr-export-gate-allow"},
-		},
-		table.ROUTE_TYPE_REJECT); err != nil {
-		b.Fatal(err)
-	}
+	installRigScopedExportGate(b, shared)
 
 	s := NewBgpServer()
 	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("100.64.12.0/24"))
@@ -458,15 +499,111 @@ func BenchmarkPrecloneRigShapeResidual(b *testing.B) {
 		}
 	})
 	// The ADD-PATH announce-leg wrapper the probe sessions actually take
-	// (server.go:1871 syncRankedAddPathSet -> syncRankedAddPathSetFromList):
+	// (syncRankedAddPathSet -> syncRankedAddPathSetFromList):
 	// per-update destination bookkeeping AROUND the skipped filterpath.
 	known := []*table.Path{path}
 	b.Run("probe-rejected-skip-addpath-sync-unit", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if got := s.syncRankedAddPathSetFromList(probe, bgp.RF_IPv4_UC, known, nil); len(got) != 0 {
+			if got := s.syncRankedAddPathSetFromList(probe, bgp.RF_IPv4_UC, known, nil, true); len(got) != 0 {
 				b.Fatal("expected no announcements")
 			}
 		}
 	})
+
+	// R-230 phase-3 units: the syncRankedAddPathSet WRAPPER against a
+	// populated table, so GetDestination pays a realistic lookup (the rig
+	// runs ~12M destinations; this rib holds 200k — the lookup is a per-
+	// family map+trie, so the unit delta understates the rig only through
+	// cache effects). "presync-bookkeeping" reconstructs the pre-phase-3
+	// wrapper body byte-for-byte (GetDestination + GetKnownPathList +
+	// FromList, per-path short-circuit armed as it was then);
+	// "hoisted-skip" is the shipped wrapper, which now proves the reject
+	// before any of it.
+	rib, syncPath := precloneBenchTable()
+
+	oldSyncBody := func(peer *peer, newPath *table.Path) []*table.Path {
+		dest := rib.GetDestination(newPath)
+		if dest == nil {
+			return nil
+		}
+		newLocalKey := newPath.GetLocalKey()
+		return s.syncRankedAddPathSetFromList(peer, bgp.RF_IPv4_UC, dest.GetKnownPathList(peer.TableID(), peer.AS()), &newLocalKey, true)
+	}
+
+	b.Run("probe-rejected-presync-bookkeeping-unit", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if got := oldSyncBody(probe, syncPath); len(got) != 0 {
+				b.Fatal("expected no announcements")
+			}
+		}
+	})
+	b.Run("probe-rejected-hoisted-skip-sync-unit", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if got := s.syncRankedAddPathSet(rib, probe, bgp.RF_IPv4_UC, syncPath, ""); len(got) != 0 {
+				b.Fatal("expected no announcements")
+			}
+		}
+	})
+	// Accepted leg: the hoisted prover dry-run is added cost for the
+	// inventory router (it walks to the allow and returns false), but the
+	// loop's per-path dry-runs are disarmed in exchange (MAJOR-5 option
+	// (a)). new-vs-old delta = the constraint-5 overhead after threading.
+	b.Run("router-accepted-presync-bookkeeping-unit", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if got := oldSyncBody(router, syncPath); len(got) == 0 {
+				b.Fatal("expected an announcement")
+			}
+		}
+	})
+	b.Run("router-accepted-hoisted-sync-unit", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if got := s.syncRankedAddPathSet(rib, router, bgp.RF_IPv4_UC, syncPath, ""); len(got) == 0 {
+				b.Fatal("expected an announcement")
+			}
+		}
+	})
 }
+
+// precloneBenchTable lazily builds the 200k-destination benchmark table
+// and the probe announce injected into it, ONCE per test binary (review
+// round 1, minor-10: the parent benchmark body re-runs per -count and per
+// sub-benchmark targeting, and rebuilding 200k destinations each time
+// dominated wall time). Benchmark runs only read the table, so sharing it
+// across invocations is safe; the injected path is returned so the
+// reannounce-key leg keys on the exact stored object.
+var precloneBenchTable = sync.OnceValues(func() (*table.TableManager, *table.Path) {
+	rib := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC})
+	src := &table.PeerInfo{
+		AS: 2, LocalAS: 1,
+		Address:      netip.MustParseAddr("10.0.0.7"),
+		ID:           netip.MustParseAddr("10.0.0.7"),
+		LocalAddress: netip.MustParseAddr("1.1.1.1"),
+		LocalID:      netip.MustParseAddr("1.1.1.1"),
+	}
+	mk := func(prefix string) *table.Path {
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+		if err != nil {
+			panic(err)
+		}
+		nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.0.0.9"))
+		if err != nil {
+			panic(err)
+		}
+		return table.NewPath(bgp.RF_IPv4_UC, src, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{2})}),
+			nh,
+		}, time.Now(), false)
+	}
+	for i := 0; i < 200_000; i++ {
+		rib.Update(mk(fmt.Sprintf("100.%d.%d.%d/32", 65+i/(256*256), i/256%256, i%256)))
+	}
+	path := mk("100.64.12.0/24")
+	rib.Update(path)
+	return rib, path
+})

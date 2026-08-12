@@ -163,8 +163,8 @@ func (s *BgpServer) WouldExport(ctx context.Context, r WouldExportRequest, fn fu
 			if sel.exhausted() {
 				break
 			}
-			// assignedExportFollows=false: this evaluator applies the
-			// staged NAMED policy below, not the peer's assigned export
+			// armPreclone=false: this evaluator applies the staged
+			// NAMED policy below, not the peer's assigned export
 			// policy — the R-230 pre-clone short-circuit must not veto
 			// paths on the assigned (reject-all on probe peers) verdict.
 			p, options, stop, _ := s.prePolicyFilterpath(peer, path, nil, false)
