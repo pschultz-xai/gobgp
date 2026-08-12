@@ -172,6 +172,14 @@ type BgpServer struct {
 	// the skip fires exactly where claimed: terminal-reject peers tick it,
 	// accepting peers and attribute-conditioned policies must not.
 	precloneRejectSkips atomic.Int64
+	// precloneSyncSkips counts per-(update, ADD-PATH peer) announce events
+	// whose entire ranked-set sync was skipped because the peer's export
+	// assignment provably rejects the destination's NLRI (the R-230
+	// phase-3 hoisted skip in syncRankedAddPathSet, ahead of the
+	// GetDestination/GetKnownPathList/selector bookkeeping). Test-only
+	// observability, same stance as precloneRejectSkips: no production
+	// metric (server.go prePolicyFilterpath, MINOR-4 caveat).
+	precloneSyncSkips atomic.Int64
 	// manage lifecycle of the server
 	isServing     atomic.Bool
 	shutdownWG    *sync.WaitGroup
@@ -598,20 +606,33 @@ func filterpath(peer *peer, path, old *table.Path) *table.Path {
 // prePolicyFilterpath computes the peer's pre-policy export view of path.
 // stop means the path is not exportable and the caller must not run policy.
 //
-// assignedExportFollows declares that the caller follows a non-stop return
-// with exactly peer.policy.ApplyPolicy(peer.TableID(),
-// POLICY_DIRECTION_EXPORT, ...). It arms the Bendrr R-230 phase-2 pre-clone
-// short-circuit: rejected (which implies stop) reports that the peer's
-// export policy assignment PROVABLY terminally rejects the path, decided
-// without paying the per-path UpdatePathAttrs clone or the post-clone
-// policy walk — under that declaration the proven verdict IS the policy
-// verdict, and rejected lets the informational adj-out caller reproduce the
-// PolicyFiltered bookkeeping that ApplyPolicy's nil produced. Callers that
-// apply anything OTHER than the peer's assigned export policy afterwards —
-// the D-031 would-export shadow evaluator applies a staged named policy
-// precisely because the assigned one is reject-all on the probe peers —
-// must pass false, which disables the short-circuit entirely.
-func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path, assignedExportFollows bool) (_ *table.Path, _ *table.PolicyOptions, stop, rejected bool) {
+// armPreclone arms the Bendrr R-230 phase-2 pre-clone short-circuit:
+// rejected (which implies stop) reports that the peer's export policy
+// assignment PROVABLY terminally rejects the path, decided without paying
+// the per-path UpdatePathAttrs clone or the post-clone policy walk.
+// Arming REQUIRES that the caller follows a non-stop return with exactly
+// peer.policy.ApplyPolicy(peer.TableID(), POLICY_DIRECTION_EXPORT, ...) —
+// under that declaration the proven verdict IS the policy verdict, and
+// rejected lets the informational adj-out caller reproduce the
+// PolicyFiltered bookkeeping that ApplyPolicy's nil produced.
+//
+// Two caller classes pass false, for different reasons; both get the full
+// — output-identical — pipeline:
+//
+//   - callers that apply anything OTHER than the peer's assigned export
+//     policy afterwards: the D-031 would-export shadow evaluator applies
+//     a staged NAMED policy precisely because the assigned one is
+//     reject-all on the probe peers, and arming would blank the shadow
+//     evaluation (correctness);
+//   - the R-230 phase-3 ranked-set sync loop when the hoisted
+//     destination-level dry-run already reported non-provable: under the
+//     wrapper's gates every per-path dry-run here shares the same
+//     destination-invariant inputs, so it is guaranteed to miss — passing
+//     false only skips the redundant walk (economics; review round 1
+//     MAJOR-5 option (a), see syncRankedAddPathSet). Even a policy swap
+//     racing between the wrapper's dry-run and this one keeps that safe:
+//     disarming never changes output, it can only forfeit a skip.
+func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path, armPreclone bool) (_ *table.Path, _ *table.PolicyOptions, stop, rejected bool) {
 	// Special handling for RTM NLRI.
 	if path != nil && path.GetFamily() == bgp.RF_RTC_UC && !path.IsWithdraw {
 		// If the given "path" is locally generated and the same with "old", we
@@ -761,7 +782,7 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path, assig
 	// metrics), so the signal is the rig's cycle-time telemetry.
 	// TestFilterpathPrecloneSharedGlobalAssignment pins the intended
 	// front-position shape.
-	if assignedExportFollows &&
+	if armPreclone &&
 		peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, path, options) &&
 		(old == nil || peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, old, options)) {
 		s.precloneRejectSkips.Add(1)
@@ -803,12 +824,23 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 // its own lock, prePolicyFilterpath reads shard-locked table snapshots, and
 // policy application is read-only against the peer's assignment.
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {
+	return s.filterpathArmed(peer, path, old, true)
+}
+
+// filterpathArmed is filterpath with the R-230 phase-2 pre-clone
+// short-circuit optionally disarmed (armPreclone=false). Disarming is
+// output-identical — the short-circuit only ever skips work whose result
+// is provably nil — and exists for the phase-3 ranked-set sync loop,
+// whose hoisted destination-level dry-run already proved the per-path
+// dry-runs here cannot fire (see prePolicyFilterpath's armPreclone doc).
+// Every other caller uses the filterpath wrapper (armed).
+func (s *BgpServer) filterpathArmed(peer *peer, path, old *table.Path, armPreclone bool) *table.Path {
 	s.filterpathEntries.Add(1)
 	// A rejected stop (R-230 phase-2 pre-clone short-circuit) needs no
 	// separate handling here: the proven verdict means ApplyPolicy below
 	// would return nil AND the old-branch would produce no synthetic
 	// withdraw, so nil is exactly what the full pipeline would return.
-	path, options, stop, _ := s.prePolicyFilterpath(peer, path, old, true)
+	path, options, stop, _ := s.prePolicyFilterpath(peer, path, old, armPreclone)
 	if stop {
 		return nil
 	}
@@ -1211,13 +1243,154 @@ func (s *BgpServer) getPossibleBest(peer *peer, family bgp.Family) []*table.Path
 //
 // The caller must hold the propagation bucket lock for newPath's prefix and
 // must pass the returned list to peer.updateRoutes before advertising.
-func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, family bgp.Family, newPath *table.Path) []*table.Path {
+//
+// peerVrf is the peer's Config.Vrf, already read by the caller once per
+// peer event — passed in so this per-(update, peer) wrapper does not
+// re-read pConf (review round 1, minor-7).
+func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, family bgp.Family, newPath *table.Path, peerVrf string) []*table.Path {
+	// Bendrr (R-230 phase-3): prover-based reject skip hoisted ABOVE the
+	// per-destination ADD-PATH sync bookkeeping — the same placement
+	// philosophy as the phase-1 withdraw map-lookup skip. The phase-2
+	// short-circuit inside prePolicyFilterpath fires on the rig's probe
+	// peers but only after this wrapper has already paid GetDestination
+	// against a ~12M-destination table, a GetKnownPathList allocation,
+	// selector setup, and a per-path PolicyOptions allocation each — all
+	// of it garbage on a provably-rejecting peer (the R-230 phase-2
+	// residual: probe pods at ~2.0x non-probe restore inject walls).
+	//
+	// Soundness of skipping the WHOLE sync on newPath's verdict alone
+	// (review round 1, BLOCKER-1): destination-invariance holds GIVEN a
+	// valid options.Info.Address, which the gate below enforces. Under
+	// that premise every whitelisted prover condition (see
+	// ProvablyRejectsPreClone) is a pure function of inputs shared by
+	// every known path at newPath's destination: PrefixCondition and
+	// AfiSafiInCondition read only the NLRI and family, and
+	// NeighborCondition reads options.Info.Address. WITHOUT the premise
+	// the invariance claim is FALSE — NeighborCondition falls back to
+	// the PER-PATH path.GetSource().Address when Info.Address is not
+	// valid, so two known paths from different sources can earn
+	// different verdicts and newPath's proven reject would silently
+	// blank a live path (reviewer repro: two known paths, a
+	// neighbor-conditioned reject on one source /32, zero-value
+	// Info.Address — one path lost). peer.peerInfo is today always
+	// stored with a valid transport address on the ESTABLISHED
+	// transition, so the fallback is latent — but it is the IsValid
+	// guard, not that invariant, that carries the argument. The skip's
+	// race argument leans on Address STABILITY, not just validity at
+	// this load (round-2 review): the store happens once per session on
+	// the ESTABLISHED transition and the value is the peer object's own
+	// remote transport address, so for a given *peer the only transition
+	// is nil→valid — a wrapper-load/loop-load divergence cannot produce
+	// a verdict the loop's own loads would not also produce.
+	//
+	// Given invariance, a proven reject for newPath is a proven reject
+	// for the destination's entire known-path list: each sync-loop
+	// filterpath below would return nil (phase-2 skip or the real walk —
+	// same verdict by the prover's equivalence argument), so the loop
+	// appends nothing and mutates nothing. Two facts carry that
+	// conclusion (review round 1, MAJOR-4 — NOT "filterpath never
+	// mutates on a nil return": its never-sent withdraw-suppression leg
+	// clears a send-max flag before returning nil): (1) known-path
+	// lists never contain withdraws — withdraws live in the
+	// destination's withdraw list, and implicitWithdraw splices
+	// replaced paths out of knownPathList (the one in-place escape
+	// hatch, GetChanges flipping old.IsWithdraw under peerDown=true, is
+	// unreachable from the sole production caller, which passes false —
+	// round-2 review nit; do not lean on that latency if a peerDown
+	// caller ever appears) — so the loop never feeds
+	// filterpath the withdraw input that mutating leg needs; and (2) a
+	// policy-rejected announce cannot BECOME a withdraw inside
+	// filterpath here either: with old=nil there is no synthetic
+	// old-path withdraw, and postFilterpath's LLGR-stale demotion clone
+	// requires a non-nil ApplyPolicy result, which the proven reject
+	// rules out. Hence every iteration returns nil having mutated
+	// nothing, and the loop's own send-max writes (sel.admit branches)
+	// only run on non-nil results. The skip returns exactly the empty
+	// set the full sync would return, having claimed no side effect.
+	//
+	// Dump-walk stand-down: NOT needed, unlike phase-1. That gate changed
+	// filterpath's OUTPUT (suppressing withdraws the pipeline would emit),
+	// so a stale dump snapshot could resurrect state behind it. This skip
+	// changes no output: the empty result means the caller's
+	// len(bestList) > 0 gate never runs markExportDumpDirty — byte-for-
+	// byte what the unskipped sync produces — and the in-flight walk
+	// evaluates its snapshot through s.filterpath independently of this
+	// wrapper, reaching the same nil verdict for the same NLRI.
+	//
+	// ADD-PATH transition safety (policy change / scope drift repair
+	// rebinding policies so previously-rejected prefixes export): the
+	// skipped sync is a pure no-op, so skipping it leaves adv bookkeeping,
+	// send-max flags, and local-ID state exactly as the full run would —
+	// untouched, nothing sent, nothing flagged. A later accepting event
+	// finds hasPathAlreadyBeenSent false and announces fresh, and the
+	// policy-change soft-reset path recomputes from the RIB without
+	// reading any state this sync would have written.
+	//
+	// Gates: VRF peers fall through — prePolicyFilterpath rewrites their
+	// paths with ToLocal, so the prover would dry-run the wrong NLRI space
+	// (the same trap as the phase-1 site's lookupPath note). RTC_UC falls
+	// through too (review round 1, minor-6): the propagateUpdateToNeighbors
+	// RTC branch diverts that family before this wrapper today, but the
+	// diversion is load-bearing — RTC announces run a policy-INDEPENDENT
+	// leg of prePolicyFilterpath (route-reflector signaling, known-path
+	// substitution) that a prover verdict does not cover, so a fail-closed
+	// reject here would be a silent VPN blackhole; the precondition is
+	// enforced at the gate instead of assumed at the call site. A nil
+	// peerInfo falls through too (prePolicyFilterpath stops on it anyway;
+	// the full sync is already a no-op then), as does a peerInfo whose
+	// Address is not valid (the BLOCKER-1 invariance premise above).
+	// Withdraws never reach this wrapper (caller branches on
+	// newPath.IsWithdraw), and the prover reports withdraws non-provable
+	// regardless.
+	//
+	// Prover economics: ADD-PATH peers with no policy or a non-provable
+	// assignment pay one dry-run plus one PolicyOptions allocation per
+	// (update, peer) — ~70ns/48B on the rig-rendered chain
+	// (BenchmarkPrecloneRigShapeResidual router-accepted units, M4)
+	// against the ~230ns/112B the skip removes from every provably-
+	// rejected unit. The dry-run does NOT always abort early, though: on
+	// a whitelist-only assignment terminating in ACCEPT it walks the
+	// entire statement chain. So when the hoisted dry-run RAN and missed,
+	// the verdict is threaded down and the loop's per-known-path phase-2
+	// dry-runs are disarmed (review round 1, MAJOR-5 option (a)): under
+	// the gates above those dry-runs share this call's destination-
+	// invariant inputs and are guaranteed to miss too, so disarming
+	// removes only redundant walks — and it is output-identical by
+	// construction even if a concurrent policy swap lands between the
+	// hoisted dry-run and the loop (the short-circuit only ever skips
+	// work whose result is provably nil; losing a late-arriving skip is
+	// economics, never correctness — see filterpathArmed). When the
+	// gates fail the loop stays armed: no hoisted dry-run ran on the
+	// loop's inputs. Non-ADD-PATH peers never reach this wrapper: zero
+	// change. Multi-peer contention (review round 1, minor-8; reviewer
+	// observation, unmeasured): the direction is FAVORABLE — a fired
+	// skip replaces the loop's K×2 shared test-counter atomics
+	// (filterpathEntries per known path, the phase-2 counter per fired
+	// short-circuit) with a single precloneSyncSkips increment.
+	//
+	// NOTE (round-2 review, new-1): the armPreclone threading is
+	// deliberately output-invisible, so NO test can pin it — reverting
+	// it passes every suite. Its only evidence is the M4 A/B benchmark:
+	// router-accepted-hoisted-sync-unit ~836 ns/op threaded vs ~897
+	// ns/op disabled (~7% at K=1, scales with K; allocs unchanged).
+	// A refactor that drops it regresses silently.
+	armPreclone := true
+	if peerVrf == "" && newPath.GetFamily() != bgp.RF_RTC_UC {
+		if peerInfo := peer.peerInfo.Load(); peerInfo != nil && peerInfo.Address.IsValid() {
+			if peer.policy.ProvablyRejectsPreClone(peer.TableID(), table.POLICY_DIRECTION_EXPORT, newPath,
+				&table.PolicyOptions{Info: peerInfo}) {
+				s.precloneSyncSkips.Add(1)
+				return nil
+			}
+			armPreclone = false
+		}
+	}
 	dest := rib.GetDestination(newPath)
 	if dest == nil {
 		return nil
 	}
 	newLocalKey := newPath.GetLocalKey()
-	return s.syncRankedAddPathSetFromList(peer, family, dest.GetKnownPathList(peer.TableID(), peer.AS()), &newLocalKey)
+	return s.syncRankedAddPathSetFromList(peer, family, dest.GetKnownPathList(peer.TableID(), peer.AS()), &newLocalKey, armPreclone)
 }
 
 // syncRankedAddPathSetFromList is the core of syncRankedAddPathSet operating
@@ -1231,12 +1404,17 @@ func (s *BgpServer) syncRankedAddPathSet(rib *table.TableManager, peer *peer, fa
 // top-SendMax, or the R-037 best-bucket + floor cut when configured);
 // everything it rejects is flagged send-max-filtered so the existing
 // withdraw-time backfill and ListPath reporting stay consistent.
-func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey) []*table.Path {
+//
+// armPreclone=false disarms the per-path phase-2 pre-clone short-circuit
+// (see filterpathArmed) and is passed only by the syncRankedAddPathSet
+// wrapper when its hoisted destination-level dry-run already proved the
+// per-path dry-runs cannot fire; every other caller passes true.
+func (s *BgpServer) syncRankedAddPathSetFromList(peer *peer, family bgp.Family, known []*table.Path, reannounceKey *table.PathLocalKey, armPreclone bool) []*table.Path {
 	sel := newExportSelector(peer.exportSelection(family))
 
 	result := []*table.Path{}
 	for _, p := range known {
-		fp := s.filterpath(peer, p, nil)
+		fp := s.filterpathArmed(peer, p, nil, armPreclone)
 		if fp == nil {
 			continue
 		}
@@ -1825,7 +2003,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							// set from the known-path list itself and is a
 							// no-op for already-converged destinations.
 							knownPathList := destination.GetKnownPathList(targetPeer.TableID(), targetPeer.AS())
-							l = append(l, s.syncRankedAddPathSetFromList(targetPeer, f, knownPathList, nil)...)
+							l = append(l, s.syncRankedAddPathSetFromList(targetPeer, f, knownPathList, nil, true)...)
 						}
 						targetPeer.updateRoutes(l...)
 						return l
@@ -1868,7 +2046,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 					// arrival order. Sync this peer's advertised set for the
 					// destination to the top-SendMax ranked paths, withdrawing
 					// any previously sent path that has been displaced.
-					bestList = s.syncRankedAddPathSet(rib, targetPeer, f, newPath)
+					bestList = s.syncRankedAddPathSet(rib, targetPeer, f, newPath, peerVrf)
 					targetPeer.updateRoutes(bestList...)
 				}
 				if needToAdvertise(targetPeer) && len(bestList) > 0 {
