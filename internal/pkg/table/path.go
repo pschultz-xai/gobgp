@@ -141,10 +141,17 @@ type Path struct {
 	pathAttrs []bgp.PathAttributeInterface
 	dels      []bgp.BGPAttrType
 	attrsHash atomic.Uint64
-	localID   uint32
-	remoteID  uint32
-	family    bgp.Family
-	rejected  bool
+	// contentKey memoizes the canonical content key used by the R-278
+	// content tie-break (see compareByContent in destination.go). nil =
+	// not computed. It follows exactly the attrsHash cache discipline:
+	// invalidated by setPathAttr/delPathAttr, copied by Clone. The
+	// stored slice is never mutated after Store, so a racing Load sees
+	// either nil or a complete immutable key.
+	contentKey atomic.Pointer[[]byte]
+	localID    uint32
+	remoteID   uint32
+	family     bgp.Family
+	rejected   bool
 	// doesn't exist in the adj
 	dropped bool
 
@@ -432,6 +439,17 @@ func (path *Path) Clone(isWithdraw bool) *Path {
 		remoteID:         path.remoteID,
 	}
 	p.attrsHash.Store(path.attrsHash.Load())
+	// contentKey is deliberately NOT copied, diverging from the attrsHash
+	// discipline: a clone reads attrs through the parent chain, so if the
+	// parent is later mutated through a funnel the parent invalidates its
+	// own key but a copied key on the clone would silently go stale.
+	// Recomputing on the clone is once and cheap; attrsHash keeps its
+	// pre-existing copy (different consumers, out of R-278 scope).
+	// RESIDUAL (round-3 review): this closes only the window before the
+	// clone's FIRST key computation. A clone whose key was already
+	// computed still goes stale if the parent is mutated afterwards —
+	// latent today (no production path clones, ranks, then mutates the
+	// parent), but clone keys are not unconditionally coherent.
 	return p
 }
 
@@ -636,6 +654,7 @@ func (path *Path) getPathAttr(typ bgp.BGPAttrType) bgp.PathAttributeInterface {
 
 func (path *Path) setPathAttr(a bgp.PathAttributeInterface) {
 	path.attrsHash.Store(0)
+	path.contentKey.Store(nil)
 	if len(path.pathAttrs) == 0 {
 		path.pathAttrs = []bgp.PathAttributeInterface{a}
 	} else {
@@ -651,6 +670,7 @@ func (path *Path) setPathAttr(a bgp.PathAttributeInterface) {
 
 func (path *Path) delPathAttr(typ bgp.BGPAttrType) {
 	path.attrsHash.Store(0)
+	path.contentKey.Store(nil)
 	if len(path.dels) == 0 {
 		path.dels = []bgp.BGPAttrType{typ}
 	} else {
@@ -1439,6 +1459,145 @@ func (p *Path) ToLocal() *Path {
 	path.localID = p.localID
 	path.remoteID = p.remoteID
 	return path
+}
+
+// contentKeyBytes returns the canonical content key for the R-278 content
+// tie-break, memoized on the Path. See compareByContent (destination.go)
+// for the full definition and rationale of the key.
+//
+// CONCURRENCY: the first computation reads the parent-linked attr chain
+// and calls attr Serialize outside any lock discipline of its own — the
+// callers (insertSort/reSort via rankBetterPath) hold the table shard
+// lock, which serializes all ranking-side computation, but the per-peer
+// FSM send loop (CreateUpdateMsgFromPaths, fsm.go) serializes the SAME
+// shared attribute objects without that lock. For attr families whose
+// Serialize mutates internal state (TunnelEncapSubTLV writes t.Length,
+// bgp.go:15349; LsTLVFlexAlgoDef, bgp.go:8857; LsTLVFADPrefixMetric,
+// bgp.go:8987) that overlap is a data race. This is the SAME class,
+// window, and precedent as the lazy updateHash/GetHash below (GetHash is
+// called from the FSM loop itself): once per path, first computation
+// only, benign-by-value for every attr family the bendrr rig carries
+// (ORIGIN/AS_PATH/NEXT_HOP/COMMUNITIES/LARGE_COMMUNITIES are
+// mutation-free). Accepted with the updateHash precedent rather than
+// introducing attr-level locking; recorded in bendrr's gobgp-findings.
+func (p *Path) contentKeyBytes() []byte {
+	if k := p.contentKey.Load(); k != nil {
+		return *k
+	}
+	k := computePathContentKey(p)
+	p.contentKey.Store(&k)
+	return k
+}
+
+// computePathContentKey builds the canonical content key: length-prefixed
+// NLRI bytes, the MP_REACH nexthop pair, then the canonically sorted
+// normalized attribute entries, each length-prefixed. Length prefixes make
+// the concatenation unambiguous: equal keys imply component-wise equal
+// content. Serialization errors degrade the failing component to its
+// normalized header with empty value bytes (see compareByContent's
+// honesty note) — deterministically, identically on every pod.
+func computePathContentKey(p *Path) []byte {
+	entries := contentAttrKeyEntries(p)
+
+	var nlriBytes []byte
+	if nlri := p.GetNlri(); nlri != nil {
+		nlriBytes, _ = nlri.Serialize()
+	}
+	nh, ll := p.mpReachNexthops()
+
+	// The key is retained for the life of the path (memoized), so the
+	// size hint is exact — len(key) == cap(key), no permanently wasted
+	// tail. A plain IPv4-unicast path has both MP_REACH nexthop slots
+	// invalid (1 byte each), so the previous 2*17 reservation wasted a
+	// flat 32 bytes per path. For the benchmark shape (/24 NLRI,
+	// ORIGIN/AS_PATH/NEXT_HOP/COMMUNITIES) the key is 49 bytes; total
+	// retained cost measured at 88 B/path (allocator size class + the
+	// 24 B slice header atomic.Pointer[[]byte] boxes separately), i.e.
+	// ~1.76 GB at a 20M-path fleet — the capacity-planning number.
+	size := 4 + len(nlriBytes) + addrKeyLen(nh) + addrKeyLen(ll)
+	for _, e := range entries {
+		size += 4 + len(e)
+	}
+	key := make([]byte, 0, size)
+	key = binary.BigEndian.AppendUint32(key, uint32(len(nlriBytes)))
+	key = append(key, nlriBytes...)
+	key = appendAddrKey(key, nh)
+	key = appendAddrKey(key, ll)
+	for _, e := range entries {
+		key = binary.BigEndian.AppendUint32(key, uint32(len(e)))
+		key = append(key, e...)
+	}
+	return key
+}
+
+// contentAttrKeyEntries returns the normalized attribute entries of the
+// content key in canonical sorted order. MP_REACH_NLRI is excluded (its
+// Value embeds the pod-local ADD-PATH localID; nexthops and NLRI are
+// covered by the other key components).
+func contentAttrKeyEntries(p *Path) [][]byte {
+	attrs := p.GetPathAttrs()
+	entries := make([][]byte, 0, len(attrs))
+	for _, a := range attrs {
+		if a.GetType() == bgp.BGP_ATTR_TYPE_MP_REACH_NLRI {
+			continue
+		}
+		entries = append(entries, normalizedAttrKeyEntry(a))
+	}
+	slices.SortFunc(entries, bytes.Compare)
+	return entries
+}
+
+// normalizedAttrKeyEntry encodes one attribute as (typeCode, flags with
+// EXTENDED_LENGTH and PARTIAL stripped, value bytes) — no wire header.
+// EXTENDED_LENGTH is a header-width choice and PARTIAL a propagation
+// artifact (validatePathAttributeFlags masks both before checking, so
+// gobgp retains whichever encoding the sender used and Serialize
+// reproduces it verbatim); neither is route content, and dropping the
+// header removes the width difference entirely (R-278 round-1 MAJOR-4).
+func normalizedAttrKeyEntry(a bgp.PathAttributeInterface) []byte {
+	flags := a.GetFlags() &^ (bgp.BGP_ATTR_FLAG_EXTENDED_LENGTH | bgp.BGP_ATTR_FLAG_PARTIAL)
+	raw, _ := a.Serialize()
+	var value []byte
+	if len(raw) > 0 {
+		hdr := 3
+		if bgp.BGPAttrFlag(raw[0])&bgp.BGP_ATTR_FLAG_EXTENDED_LENGTH != 0 {
+			hdr = 4
+		}
+		if len(raw) > hdr {
+			value = raw[hdr:]
+		}
+	}
+	e := make([]byte, 0, 2+len(value))
+	e = append(e, byte(a.GetType()), byte(flags))
+	return append(e, value...)
+}
+
+// appendAddrKey appends a tagged encoding of a nexthop address: a tag
+// byte (0 invalid, 4 IPv4, 16 IPv6), then the 16-byte expansion for valid
+// addresses. The tag byte is load-bearing framing: without it an invalid
+// nexthop is indistinguishable from a shifted link-local, and a plain
+// IPv4 address from its IPv4-mapped IPv6 form (identical As16). That last
+// pair is a deliberate content DISTINCTION, not an artifact: 10.0.0.1 and
+// ::ffff:10.0.0.1 have distinct wire encodings (4 vs 16 nexthop bytes)
+// that survive round-trips, so every receiver of the same UPDATE agrees
+// on the form. Zones are dropped by As16 — they name pod-local interfaces
+// and are deliberately not content.
+func appendAddrKey(key []byte, a netip.Addr) []byte {
+	if !a.IsValid() {
+		return append(key, 0)
+	}
+	b := a.As16()
+	key = append(key, byte(a.BitLen()/8))
+	return append(key, b[:]...)
+}
+
+// addrKeyLen mirrors appendAddrKey's emitted length for the exact-size
+// key allocation.
+func addrKeyLen(a netip.Addr) int {
+	if !a.IsValid() {
+		return 1
+	}
+	return 17
 }
 
 // updateHash must stay in sync with the shared per-UPDATE hash in

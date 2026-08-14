@@ -424,7 +424,16 @@ func (dest *destination) implicitWithdraw(logger *slog.Logger, newPath *Path) *P
 // rankBetterPath runs the full best-path comparator chain over one pair and
 // returns the preferred path, or nil on a complete tie. This is the single
 // definition of the ranking used by both the incremental insertSort and the
-// full reSort a D-066 location-metric reload performs.
+// full reSort a D-066 location-metric reload performs. Since Bendrr R-278
+// the chain ends in compareByContent then compareByPathID, so a nil return
+// means the two paths carry identical canonical content keys AND the same
+// ADD-PATH path identifier. Same-source paths sharing both normally cannot
+// coexist — that is the implicit-withdraw identity — but implicitWithdraw
+// skips paths flagged NoImplicitWithdraw, so such twins CAN coexist and
+// tie completely; they are interchangeable by content and id, so the
+// positional fallback in insertSort orders them arbitrarily but
+// harmlessly. Beyond that exception, complete ties are confined to
+// distinct-source pairs the neighbor-address step could not split.
 //
 //	Best path processing will involve following steps:
 //	1.  Select a path with a reachable next hop.
@@ -484,7 +493,10 @@ func rankBetterPath(path1, path2 *Path) *Path {
 	if b := compareByNeighborAddress(path1, path2); b != nil {
 		return b
 	}
-	return nil
+	if b := compareByContent(path1, path2); b != nil {
+		return b
+	}
+	return compareByPathID(path1, path2)
 }
 
 // EqualThroughLocationMetric reports whether two paths tie at every
@@ -522,7 +534,14 @@ func (dest *destination) insertSort(newPath *Path) {
 	// Find the correct position for newPath. The slice is assumed to be in
 	// descending order: most preferred to least. On a complete tie the new
 	// path is inserted before the equal element (matching historical
-	// behavior).
+	// behavior). Since R-278 a complete tie requires identical canonical
+	// content key AND identical path id (compareByContent +
+	// compareByPathID) — reachable for same-source paths only through the
+	// NoImplicitWithdraw flag (implicitWithdraw skips flagged paths, so
+	// key-and-id twins can coexist), otherwise only for distinct-source
+	// pairs the neighbor-address step could not split. Either way the tied
+	// paths are interchangeable by content and id, so this positional
+	// fallback is harmless — not the ordinary path for injected twins.
 	insertIdx := sort.Search(len(dest.knownPathList), func(i int) bool {
 		return rankBetterPath(newPath, dest.knownPathList[i]) != dest.knownPathList[i]
 	})
@@ -1035,6 +1054,191 @@ func compareByAge(path1, path2 *Path) *Path {
 		} else if age1 < age2 {
 			return path1
 		}
+		return path2
+	}
+	return nil
+}
+
+// compareByContent (Bendrr R-278) is the penultimate comparator in
+// rankBetterPath: a pure determinism tie-break on stable route content for
+// pairs on which every operational comparator above abstained (the
+// absolute-final step is compareByPathID below, for content-identical
+// twins). Before R-278, a complete tie fell through to insertSort's
+// positional insert-before-equal, so the winner among fully-tied paths was
+// newest-first arrival order: nondeterministic across pods (different
+// arrival order, different best path, different exports for identical
+// inputs) and churn-prone (every re-add of a tied candidate re-shuffled
+// the export — the same churn class the R-037 round-2 fix closed for D-066
+// metric reloads, see compareByNeighborAddress). Lower content key
+// compares first, matching the lowest-wins convention of the router-ID and
+// neighbor-address steps.
+//
+// SCOPE: fires for ALL complete ties, not only both-source-less (locally
+// injected) pairs. Two pair classes reach the bottom: (a) both-source-less
+// injected pairs — the R-278 motivation — which tie on age whenever they
+// arrive in the same Unix second (and always once external-compare-router-id
+// is armed), then tie on router ID (both IsLocal) and neighbor address (both
+// invalid, the deliberate R-037 genuine tie); and (b) same-peer ADD-PATH
+// twins — different peers never fully tie because compareByNeighborAddress
+// splits them, but same-source twins tie on router ID and neighbor address,
+// and iBGP twins skip compareByAge entirely. Class (b) is how every OTHER
+// pod sees a pod's injected candidate set (mesh-learned twins from one
+// neighbor), so scoping the comparator to source-less pairs would fix the
+// origin pod and leave every receiving pod arrival-ordered — half a
+// determinism claim. Firing everywhere is also the easiest form to prove
+// valid (no guard asymmetry to reason about), and the blast radius is
+// confined to pairs where every operational comparator already abstained:
+// today's order there is arbitrary arrival order, so no preference
+// semantics change — only WHICH arbitrary order, now the same on every pod.
+// Note this changes the default chain too, independent of the R-277
+// selection knobs.
+//
+// VALIDITY: the canonical content key (computePathContentKey, path.go) is
+// a pure function of each path alone and the comparison is a single
+// bytes.Compare, so the relation is a strict weak ordering by
+// construction — antisymmetric, transitive, and safe for insertSort's
+// sort.Search and reSort's sort.SliceStable, unlike the historical
+// first-argument-wins fallback R-037 round-2 removed. nil is returned
+// ONLY when the two canonical content keys are identical. Byte-identical
+// content always yields identical keys; the converse has two documented
+// slack cases. First, serialization failures degrade the failing
+// component to a normalized header with empty value bytes, so two paths
+// whose difference lives entirely inside an unserializable component
+// (e.g. two EVPN IP-prefix NLRIs whose Serialize fails on different
+// ETags) also tie — deterministically, identically on every pod. Second,
+// the key is deliberately canonical rather than wire-faithful: the same
+// attribute multiset in a different stored slice order, or with
+// different EXTENDED_LENGTH/PARTIAL header encodings, ties here even
+// though Path.Equal (hash over stored-order raw TLVs) calls the paths
+// unequal — so among key-equal paths the WIRE bytes of the eventually
+// exported UPDATE can still depend on which path object won; only the
+// ranking is canonicalized.
+//
+// CONTENT means route content only. Compared, via the memoized key: NLRI
+// serialized bytes (ADD-PATH identifiers cannot leak in: this fork keeps
+// them in PathNLRI.ID beside the NLRI, and NLRI.Serialize never emits
+// them), the MP_REACH nexthop pair — where a plain IPv4 nexthop and its
+// IPv4-mapped IPv6 form (::ffff:a.b.c.d) are distinct content, NOT a
+// normalized-away encoding artifact: the two forms have distinct wire
+// encodings (4 vs 16 nexthop bytes) that survive round-trips, so every
+// receiver of the same UPDATE agrees on the form (see appendAddrKey) —
+// and every path attribute except
+// MP_REACH_NLRI as normalized (type, flags minus EXTENDED_LENGTH and
+// PARTIAL, value bytes) entries — the wire header is dropped, so
+// header-width and propagation-artifact flag differences are not content
+// (round-1 MAJOR-4). Excluded as pod-local or arrival-dependent:
+// timestamps, source/peer fields (router ID, neighbor address, AS),
+// localID (the locally allocated ADD-PATH identifier — note Calculate
+// assigns it AFTER first-add insertSort but implicitWithdraw copies it
+// onto a re-add BEFORE insertSort, so a leak would rank re-adds
+// differently from first adds), remoteID (handled separately by
+// compareByPathID below), and the MP_REACH_NLRI attribute, whose
+// in-memory Value embeds localID. Default Serialize omits per-NLRI IDs
+// today, but nothing here pins that marshalling default, so MP_REACH is
+// excluded outright and its nexthops encoded explicitly — the same stance
+// Path.Equal and updateHash take (there so the hash can double as the
+// UPDATE batching key). Its remaining content is covered: the AFI/SAFI is
+// the destination's own family and the NLRI list is the path's own NLRI,
+// both already in the key.
+//
+// "Identical on every pod that holds the same logical route" holds to
+// this extent: wire-learned attrs are normalized at ingestion (every
+// received UPDATE passes UpdatePathAttrs4ByteAs, fsm.go, which rewrites
+// 2-byte AsPathParam to As4PathParam in place, so a 2-byte AS_PATH
+// encoding cannot reach the RIB), header encodings are normalized here,
+// and attr slice order is canonicalized. The residual: two API clients
+// building the same logical AS_PATH with different param types
+// (AsPathParam vs As4PathParam) on different pods would compare unequal —
+// still a valid ordering, and unreachable in bendrr, where one driver
+// builds every injected path; mixed local/wire pairs never meet here at
+// all because compareByLocalOrigin splits them earlier.
+//
+// ATTRIBUTE ORDER: attribute entries are compared in canonical sorted
+// order, not stored slice order. GetPathAttrs preserves arrival order for
+// wire-learned attributes but append-then-sorts newly added ones, so the
+// same logical path can carry differently-ordered attr slices depending
+// on construction history (API-injected on one pod, mesh-learned on
+// another). Stored-order comparison would still be a valid ordering, but
+// two semantically equal paths could compare unequal — and worse,
+// differently-ordered — across pods, defeating the cross-pod determinism
+// this comparator exists to provide. Sorting makes the key a function of
+// the attribute SET. BGP forbids duplicate attribute types, so the sort
+// is a plain relabeling; even for a malformed duplicate-type pair it
+// remains deterministic.
+//
+// COST: the key is memoized on the Path (round-1 MAJOR-2; invalidation
+// follows attrsHash exactly — see contentKeyBytes in path.go, including
+// the concurrency argument for the first computation), so steady-state
+// tied compares are a single allocation-free bytes.Compare and a D-066
+// reload reSort stays near the pre-R-278 allocation baseline.
+//
+// NON-TRANSITIVITY ABOVE: the chain above remains non-transitive through
+// compareByMED's comparability groups, and a strict ordering at the
+// bottom does not repair that — in principle MED can still complete
+// preference 3-cycles that sort.SliceStable resolves arbitrarily (a
+// constructive search over 3-group populations found no realized cycle;
+// the mechanism is what's documented here).
+//
+// PLACEMENT: below the location-metric slot in rankBetterPath ONLY, per the
+// LOCKSTEP comment above rankPreMetricComparators — a pure determinism
+// tie-break must not enter the shared slice nor EqualThroughLocationMetric,
+// so R-037 bucket membership for ADD-PATH export is bit-for-bit unchanged.
+func compareByContent(path1, path2 *Path) *Path {
+	c := comparePathContent(path1, path2)
+	if c < 0 {
+		return path1
+	} else if c > 0 {
+		return path2
+	}
+	return nil
+}
+
+// comparePathContent returns a three-way comparison of the memoized
+// canonical content keys (see compareByContent for what the key includes
+// and excludes, and computePathContentKey in path.go for its layout).
+func comparePathContent(path1, path2 *Path) int {
+	return bytes.Compare(path1.contentKeyBytes(), path2.contentKeyBytes())
+}
+
+// compareByPathID (Bendrr R-278 round-2, review MAJOR-1) is the
+// absolute-final comparator: content-identical twins order by ADD-PATH
+// path identifier (remoteID), lower first. Without it, byte-identical
+// twins — which differ ONLY in path id — still fell to insertSort's
+// positional tie, so their order was arrival-dependent and re-add-mobile;
+// with bucket-aware export (exportSelector admits ranked bucket members up
+// to a slot cap) WHICH twins export was arrival-dependent, and receivers
+// see path ids, so the difference is visible on the wire.
+//
+// Why remoteID is safe here: for wire-learned twins it is the ORIGIN
+// pod's exported path identifier — every receiver of the same origin
+// holds the same (content, id) pairs, so all receivers agree and re-adds
+// are stable. Note what that identifier actually IS: the origin's localID
+// from the FindandSetZeroBit allocator — arrival-ordered and reuse-prone,
+// an arbitrary origin-assigned value, not content-derived. Receivers
+// therefore agree on an ARBITRARY order, and a full withdraw/re-add cycle
+// at the origin can reassign the id and reorder every receiver — in
+// lockstep. That is still strictly better than the pre-R-278 state, where
+// each receiver ordered twins by its own arrival history and pods could
+// disagree with no origin-side change at all. For locally injected twins
+// remoteID is the driver-chosen path_id, per-path stable, so origin-side
+// order is deterministic too. RESIDUAL, stated honestly: cross-pod
+// agreement for content-identical LOCAL twins additionally requires the
+// driver to assign the same path_ids for the same logical routes on every
+// pod — if two pods hold identical content under different ids, they can
+// rank the twins differently, though the difference is only visible as a
+// path-id swap between routes an operator cannot otherwise tell apart. A
+// nil return (complete tie) requires identical content key AND identical
+// path id. Same-source paths sharing both are collapsed by
+// implicitWithdraw — UNLESS flagged NoImplicitWithdraw (implicitWithdraw
+// skips flagged paths), which lets full key-and-id twins coexist; those
+// are interchangeable by content and id, so insertSort's positional
+// fallback orders them arbitrarily but harmlessly. Otherwise the residual
+// positional tie is confined to pairs from distinct sources that every
+// comparator above — including neighbor address — failed to split.
+func compareByPathID(path1, path2 *Path) *Path {
+	if path1.remoteID < path2.remoteID {
+		return path1
+	} else if path1.remoteID > path2.remoteID {
 		return path2
 	}
 	return nil
