@@ -128,11 +128,15 @@ func TestNeighAddrTieBreak(t *testing.T) {
 }
 
 // R-037 round-2: two locally injected paths (source address invalid on both
-// sides) that tie on every attribute must compare as a genuine tie in BOTH
-// argument orders. The historical first-argument-wins fallback made
-// rankBetterPath an invalid ordering for exactly the paths PSA injects, so
-// sort.SliceStable could permute fully-tied local paths on every D-066
-// metric reload and churn bucket-mode exports for no input change.
+// sides) that tie on every attribute must compare as a genuine tie at the
+// neighbor-address step in BOTH argument orders. The historical
+// first-argument-wins fallback made rankBetterPath an invalid ordering for
+// exactly the paths PSA injects, so sort.SliceStable could permute
+// fully-tied local paths on every D-066 metric reload and churn bucket-mode
+// exports for no input change. Since R-278 the FULL chain no longer ties
+// here: these content-identical twins order deterministically by ADD-PATH
+// path id (lower first), symmetric in argument order — still a valid
+// ordering, which is what this test pins.
 func TestNeighAddrLocalPathsTieSymmetrically(t *testing.T) {
 	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
 
@@ -145,8 +149,9 @@ func TestNeighAddrLocalPathsTieSymmetrically(t *testing.T) {
 
 	assert.Nil(t, compareByNeighborAddress(p0, p1))
 	assert.Nil(t, compareByNeighborAddress(p1, p0))
-	assert.Nil(t, rankBetterPath(p0, p1), "fully tied local paths must not be ordered")
-	assert.Nil(t, rankBetterPath(p1, p0))
+	assert.Equal(t, p0, rankBetterPath(p0, p1),
+		"content-identical local twins must order by path id, not argument order")
+	assert.Equal(t, p0, rankBetterPath(p1, p0))
 }
 
 func TestMedTieBreaker(t *testing.T) {
@@ -704,52 +709,60 @@ func BenchmarkMultiPath(b *testing.B) {
 	})
 }
 
+// NOTE (Bendrr R-278): these paths are source-less with identical attributes
+// and one FIXED timestamp, so they tie through every operational comparator
+// and their relative order is decided by the final content tie-break —
+// ascending NLRI bytes here — where it used to be newest-first arrival
+// order. The asserted orders below pin the content order. The fixed
+// timestamp matters: with time.Now() the paths only tied on age when the
+// calls landed in the same second, a rare-but-real flake.
 func TestDestination_Calculate_AddAndWithdrawPath(t *testing.T) {
+	ts := time.Unix(100, 0)
 	attrs := []bgp.PathAttributeInterface{
 		bgp.NewPathAttributeOrigin(0),
 	}
 	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("13.2.3.0/24"))
-	p1 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+	p1 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, false)
 	nlri, _ = bgp.NewIPAddrPrefix(netip.MustParsePrefix("13.2.4.0/24"))
-	p2 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+	p2 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, false)
 	nlri, _ = bgp.NewIPAddrPrefix(netip.MustParsePrefix("13.2.5.0/24"))
-	p3 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+	p3 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, false)
 	d := newDestination(nlri, 0, p1, p2, p3)
 
 	nlri, _ = bgp.NewIPAddrPrefix(netip.MustParsePrefix("13.2.6.0/24"))
-	p4 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+	p4 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, false)
 	dd, _ := d.Calculate(logger, p4)
 	update := dd
 	assert.Len(t, update.KnownPathList, 3)
 	assert.Len(t, update.KnownPathList, 3)
 	assert.NotEqualValues(t, update.OldKnownPathList, update.KnownPathList)
-	assert.Equal(t, "13.2.6.0/24", update.KnownPathList[0].GetNlri().String())
-	assert.Equal(t, "13.2.4.0/24", update.KnownPathList[1].GetNlri().String())
+	assert.Equal(t, "13.2.4.0/24", update.KnownPathList[0].GetNlri().String())
+	assert.Equal(t, "13.2.5.0/24", update.KnownPathList[1].GetNlri().String())
 
 	// p1 is no implecit withdrawn
 	nlri, _ = bgp.NewIPAddrPrefix(netip.MustParsePrefix("13.2.3.0/24"))
-	p1 = NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), true)
+	p1 = NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, true)
 	d = newDestination(nlri, 0, p1, p2, p3)
 	update, _ = d.Calculate(logger, p4)
 	assert.Len(t, update.KnownPathList, 3)
 	assert.Len(t, update.KnownPathList, 3)
 	assert.NotEqualValues(t, update.OldKnownPathList, update.KnownPathList)
 
-	assert.Equal(t, "13.2.6.0/24", update.KnownPathList[0].GetNlri().String())
-	assert.Equal(t, "13.2.3.0/24", update.KnownPathList[1].GetNlri().String())
-	assert.Equal(t, "13.2.5.0/24", update.KnownPathList[2].GetNlri().String())
+	assert.Equal(t, "13.2.3.0/24", update.KnownPathList[0].GetNlri().String())
+	assert.Equal(t, "13.2.5.0/24", update.KnownPathList[1].GetNlri().String())
+	assert.Equal(t, "13.2.6.0/24", update.KnownPathList[2].GetNlri().String())
 
 	nlri, _ = bgp.NewIPAddrPrefix(netip.MustParsePrefix("13.2.8.0/24"))
-	p5 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+	p5 := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, false)
 	d = newDestination(nlri, 0, p1, p2, p3, p5)
 	update, _ = d.Calculate(logger, p4)
 
 	assert.Len(t, update.KnownPathList, 4)
 	assert.Len(t, update.KnownPathList, 4)
 	assert.NotEqualValues(t, update.OldKnownPathList, update.KnownPathList)
-	assert.Equal(t, "13.2.6.0/24", update.KnownPathList[0].GetNlri().String())
-	assert.Equal(t, "13.2.3.0/24", update.KnownPathList[1].GetNlri().String())
-	assert.Equal(t, "13.2.5.0/24", update.KnownPathList[2].GetNlri().String())
+	assert.Equal(t, "13.2.3.0/24", update.KnownPathList[0].GetNlri().String())
+	assert.Equal(t, "13.2.5.0/24", update.KnownPathList[1].GetNlri().String())
+	assert.Equal(t, "13.2.6.0/24", update.KnownPathList[2].GetNlri().String())
 	assert.Equal(t, "13.2.8.0/24", update.KnownPathList[3].GetNlri().String())
 }
 
