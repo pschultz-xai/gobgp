@@ -5519,7 +5519,7 @@ func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string) (*Bgp
 		Peer: oc.NewPeerFromConfigStruct(neighbor),
 	})
 	require.NoError(t, err)
-	w.Wait(t, 10*time.Second)
+	w.Wait(t)
 
 	peer := s.neighborMap[netip.MustParseAddr(peerAddr)]
 	require.NotNil(t, peer)
@@ -5547,7 +5547,7 @@ func establishSession(t *testing.T, s *BgpServer, peer *peer, asn uint32, peerAd
 	m.PushBgpMessage(openMsg)
 	m.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
 
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, 10*time.Second)
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED)
 
 	return m
 }
@@ -5581,7 +5581,7 @@ func TestResetPeerWhileDownDoesNotResetNextSession(t *testing.T) {
 	// Bring the session down and wait until the peer settles in ACTIVE.
 	// Passive mode and no listener: it cannot progress on its own.
 	m1.Close()
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE)
 
 	// Reset the peer while it is down: exactly what the BFD code does when
 	// its detect timer expires after the BGP session already ended.
@@ -5623,7 +5623,7 @@ func TestResetPeerEstablishedSendsNotification(t *testing.T) {
 		Soft:          false,
 	})
 	require.NoError(t, err)
-	w.Wait(t, 10*time.Second)
+	w.Wait(t)
 
 	require.Eventually(t, func() bool {
 		n := sentNotification(m1)
