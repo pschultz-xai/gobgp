@@ -1432,7 +1432,8 @@ module gobgp {
         tie with the best path through the location-metric comparator
         slot (the best bucket), padded with next-ranked paths up to
         min-paths when the bucket is thin. send-max remains the absolute
-        ceiling. Zero disables bucketing (flat top-send-max).";
+        ceiling. Zero disables bucketing (flat top-send-max,
+        upstream-compatible).";
       type uint8;
     }
     leaf min-paths {
