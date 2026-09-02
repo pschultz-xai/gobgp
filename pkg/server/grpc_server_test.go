@@ -285,6 +285,7 @@ func GRPCwaitState(t *testing.T, s api.GoBgpServiceClient, state api.PeerState_S
 						if err != nil {
 							t.Errorf("failed to unmarshal remote capabilities: %v", err)
 						}
+						allFound := true
 						for _, rf := range expectedFamilies {
 							found := false
 							for _, cap := range remoteCaps {
@@ -294,8 +295,16 @@ func GRPCwaitState(t *testing.T, s api.GoBgpServiceClient, state api.PeerState_S
 								}
 							}
 							if !found {
-								return
+								allFound = false
+								break
 							}
+						}
+						if !allFound {
+							// R-264: keep watching — the state can be reached
+							// before every expected capability shows up, and a
+							// later event carries the full set. Returning here
+							// abandoned the WaitGroup and hung wg.Wait() forever.
+							continue
 						}
 						watchCancel()
 						wg.Done()
