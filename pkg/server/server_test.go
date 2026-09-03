@@ -709,8 +709,11 @@ const peerStateWaitFloor = 10 * time.Second
 // -timeout deadline, shared by every test in the package run, so an
 // uncapped budget would let one genuinely unreachable state consume nearly
 // the whole shared allowance and cascade bogus failures into every later
-// Wait. 90s is 9x the budget that flaked under load and well under the 10m
-// default -timeout for this ~220s package.
+// Wait. 90s is 9x the budget that flaked under load; the package measures
+// ~342s non-race after the 4.9.0 rebase, and its 29 Wait/waitPeerState
+// call sites at 90s worst-case each (~43m serial) exceed the 10m default
+// -timeout — diagnosing a genuine convergence break needs the -timeout
+// the CI job sets, not the go test default.
 const peerStateWaitCap = 90 * time.Second
 
 // Wait blocks until the watched state change arrives, deriving its budget

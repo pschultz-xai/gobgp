@@ -66,9 +66,11 @@ func TestExtendedMessage_AdvertisedUnconditionally(t *testing.T) {
 	require.NoError(t, peerServers(t, ctx, []*BgpServer{s1, s2},
 		[]oc.AfiSafiType{oc.AFI_SAFI_TYPE_IPV4_UNICAST}))
 
-	// Pre-R-219 this was the one 20s call site (extended-message capability
-	// exchange establishes slower); the shared clamped budget covers the
-	// passing case. On a genuine failure Wait blocks up to its 90s cap even
+	// Pre-R-219 this was the one 20s call site — upstream gave it an
+	// explicit 20s budget, double every other site's 10s (extended-message
+	// capability exchange establishes slower) — and the 90s cap covers it.
+	// If peerStateWaitFloor is ever reduced below 20s, this site is the
+	// slow one to re-check. On a genuine failure Wait blocks up to its 90s cap even
 	// though this test's own context above is 30s (nothing consumes the ctx
 	// while Wait blocks), so failure reporting is up to 60s slower —
 	// accepted on an already-failing test.
